@@ -29,6 +29,7 @@ from polyweather.trading.paper import (
     execute_pending_signals,
     list_positions,
 )
+from polyweather.trading.resolver import settle_open_positions
 
 
 @asynccontextmanager
@@ -202,6 +203,20 @@ async def trigger_scan(execute: bool = Query(False, description="Also open paper
         opened = execute_pending_signals()
         result["paper_positions_opened"] = opened
     return result
+
+
+@app.post("/settle")
+async def trigger_settle(
+    only_past_settle: bool = Query(
+        True, description="Skip positions whose settle_time is still in the future",
+    ),
+) -> dict:
+    """Resolve open paper positions by re-reading final Polymarket prices.
+
+    For each open position whose market has resolved, close it and record
+    a calibration row. Safe to call repeatedly.
+    """
+    return await settle_open_positions(only_past_settle=only_past_settle)
 
 
 @app.get("/scans")
