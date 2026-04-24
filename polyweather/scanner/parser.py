@@ -29,11 +29,14 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
 
 from polyweather.cities import CITIES
 from polyweather.scanner.models import Event, Market
 
 log = logging.getLogger(__name__)
+
+MarketType = Literal["high", "low", "precip", "other"]
 
 _CITY_ALIASES: dict[str, str] = {
     "nyc": "NYC", "new york": "NYC", "new york city": "NYC", "jfk": "NYC",
@@ -74,11 +77,41 @@ class ParsedEvent:
     group_id: str                  # negRiskMarketID or fallback event id
     title: str
     city_code: str
+    market_type: MarketType        # how to aggregate the ensemble
     settle_time_utc: datetime | None
     liquidity_usd: float
     volume_usd: float
     buckets: list[ParsedBucket]
     raw: dict                      # the original event dict (for DB storage)
+
+
+def detect_market_type(title: str) -> MarketType:
+    """Infer what aggregation of the ensemble this market asks about.
+
+    - ``high``   → daily max (afternoon high temperature)
+    - ``low``    → daily min (overnight/morning low temperature)
+    - ``precip`` → rainfall / snowfall — unsupported in Phase 1
+    - ``other``  → anything unrecognized; caller should skip
+    """
+    t = (title or "").lower()
+    if "precipitation" in t or "rainfall" in t or "snowfall" in t or "snow " in t or "rain " in t:
+        return "precip"
+    if "lowest temp" in t or "low temp" in t or "minimum temp" in t or "min temp" in t:
+        return "low"
+    if "highest temp" in t or "high temp" in t or "maximum temp" in t or "max temp" in t:
+        return "high"
+    # Defensive: if question just says "temperature", default to high but flag
+    if "temperature" in t:
+        return "high"
+    return "other"
+
+
+_PRECIP_HINTS = re.compile(r'["′″]|inches|inch|mm\b|cm\b', re.IGNORECASE)
+
+
+def _bucket_label_is_precip(label: str) -> bool:
+    """Bucket labels with inches / mm / cm / `"` chars are rainfall, not temp."""
+    return bool(_PRECIP_HINTS.search(label or ""))
 
 
 def detect_city(*texts: str | None) -> str | None:
@@ -166,6 +199,11 @@ def parse_event(event: Event) -> ParsedEvent | None:
     if not city:
         return None
 
+    market_type = detect_market_type(event.title or "")
+    if market_type in ("precip", "other"):
+        log.debug("skip event type=%s title=%r", market_type, event.title)
+        return None
+
     raw_markets = event.markets or []
     if not raw_markets:
         return None
@@ -179,7 +217,12 @@ def parse_event(event: Event) -> ParsedEvent | None:
     for m in raw_markets:
         if not _market_is_usable(m):
             continue
-        lo, hi = parse_bucket_label(m.groupItemTitle or "")
+        label = m.groupItemTitle or ""
+        if _bucket_label_is_precip(label):
+            # Defensive: a title slipped through (e.g. "temperature and rainfall")
+            # but this bucket is clearly non-temperature. Skip it.
+            continue
+        lo, hi = parse_bucket_label(label)
         if lo is None and hi is None:
             continue
         if group_id is None and m.negRiskMarketID:
@@ -188,7 +231,7 @@ def parse_event(event: Event) -> ParsedEvent | None:
         buckets.append(
             ParsedBucket(
                 token_id=m.yes_token_id or "",
-                outcome_label=m.groupItemTitle or "",
+                outcome_label=label,
                 low=lo,
                 high=hi,
                 yes_price=m.yes_price,
@@ -206,6 +249,7 @@ def parse_event(event: Event) -> ParsedEvent | None:
         group_id=group_id or str(event.id or event.slug or ""),
         title=event.title or "",
         city_code=city,
+        market_type=market_type,
         settle_time_utc=settle,
         liquidity_usd=liquidity,
         volume_usd=volume,
@@ -238,19 +282,26 @@ def group_flat_markets(markets: list[Market]) -> list[ParsedEvent]:
         if not city:
             continue
 
+        market_type = detect_market_type(title)
+        if market_type in ("precip", "other"):
+            continue
+
         buckets: list[ParsedBucket] = []
         liquidity = 0.0
         volume = 0.0
         settle: datetime | None = None
 
         for m in usable:
-            lo, hi = parse_bucket_label(m.groupItemTitle or "")
+            label = m.groupItemTitle or ""
+            if _bucket_label_is_precip(label):
+                continue
+            lo, hi = parse_bucket_label(label)
             if lo is None and hi is None:
                 continue
             buckets.append(
                 ParsedBucket(
                     token_id=m.yes_token_id or "",
-                    outcome_label=m.groupItemTitle or "",
+                    outcome_label=label,
                     low=lo,
                     high=hi,
                     yes_price=m.yes_price,
@@ -269,6 +320,7 @@ def group_flat_markets(markets: list[Market]) -> list[ParsedEvent]:
                 group_id=group_id,
                 title=title,
                 city_code=city,
+                market_type=market_type,
                 settle_time_utc=settle,
                 liquidity_usd=liquidity,
                 volume_usd=volume,

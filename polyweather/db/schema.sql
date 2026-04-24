@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS markets (
     slug            TEXT,
     question        TEXT NOT NULL,
     city_code       TEXT,
+    market_type     TEXT,                     -- 'high' | 'low' | 'precip' | 'other'
     settle_time_utc TEXT,
     liquidity_usd   REAL DEFAULT 0,
     volume_usd      REAL DEFAULT 0,

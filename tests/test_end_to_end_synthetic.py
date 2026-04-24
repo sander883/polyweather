@@ -78,16 +78,22 @@ def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
     assert pe is not None and pe.city_code == "NYC"
     assert len(pe.buckets) == 5
 
-    # Synthetic ensemble concentrated in 70-74
-    members = [68.0] + [71.0] * 8 + [72.0] * 10 + [73.0] * 8 + [76.0] * 4
+    # Synthetic ensemble concentrated in 70-74; min kept low to validate
+    # that the scanner picks the right array based on market_type.
+    members_max = [68.0] + [71.0] * 8 + [72.0] * 10 + [73.0] * 8 + [76.0] * 4
+    members_min = [52.0] * 31
     fc = EnsembleForecast(
         city_code="NYC",
         source="gfs_ensemble",
         run_time_utc=datetime.now(timezone.utc),
         target_date=settle.date(),
         target_time_utc=settle.replace(hour=23, minute=59, second=59),
-        daily_max_f_per_member=members,
+        daily_max_f_per_member=members_max,
+        daily_min_f_per_member=members_min,
     )
+    # Event must be "high" type for this test's expectations
+    assert pe.market_type == "high"
+    members = fc.samples_for(pe.market_type)
     assert persist_forecast(fc) > 0
 
     market_id, tok_to_bucket = _upsert_event(pe)

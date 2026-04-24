@@ -1,3 +1,13 @@
-from polyweather.fetchers.gfs_ensemble import fetch_gfs_ensemble, EnsembleForecast
+from polyweather.fetchers.gfs_ensemble import (
+    EnsembleForecast,
+    fetch_gfs_ensemble,
+    load_members,
+    persist_forecast,
+)
 
-__all__ = ["fetch_gfs_ensemble", "EnsembleForecast"]
+__all__ = [
+    "EnsembleForecast",
+    "fetch_gfs_ensemble",
+    "load_members",
+    "persist_forecast",
+]

@@ -15,7 +15,11 @@ from polyweather.cities import CITIES
 from polyweather.config import get_settings
 from polyweather.db.connection import get_conn
 from polyweather.db.init import init_db
-from polyweather.fetchers.gfs_ensemble import fetch_gfs_ensemble, persist_forecast
+from polyweather.fetchers.gfs_ensemble import (
+    fetch_gfs_ensemble,
+    load_members,
+    persist_forecast,
+)
 from polyweather.logging_setup import setup_logging
 from polyweather.model.calibration import reliability_bins
 from polyweather.model.probability import summary_stats
@@ -85,8 +89,14 @@ async def forecast(
             "city": code,
             "target_date": target_date.isoformat(),
             "source": "gfs_ensemble",
-            "members": fc.daily_max_f_per_member,
-            "stats": summary_stats(fc.daily_max_f_per_member),
+            "max": {
+                "members": fc.daily_max_f_per_member,
+                "stats": summary_stats(fc.daily_max_f_per_member),
+            },
+            "min": {
+                "members": fc.daily_min_f_per_member,
+                "stats": summary_stats(fc.daily_min_f_per_member),
+            },
         }
 
     with get_conn() as conn:
@@ -106,16 +116,21 @@ async def forecast(
             404,
             f"No cached forecast for {code} on {target_date}. Retry with fresh=true.",
         )
-    import json as _json
-    members = _json.loads(row["members_json"])
-    return {
+    maxes = load_members(row["members_json"], "max")
+    result = {
         "city": code,
         "target_date": target_date.isoformat(),
         "source": "gfs_ensemble",
         "fetched_at": row["fetched_at"],
-        "members": members,
-        "stats": summary_stats(members),
+        "max": {"members": maxes, "stats": summary_stats(maxes)},
     }
+    try:
+        mins = load_members(row["members_json"], "min")
+        result["min"] = {"members": mins, "stats": summary_stats(mins)}
+    except ValueError:
+        # Legacy row: max-only, omit min block
+        pass
+    return result
 
 
 @app.get("/markets")

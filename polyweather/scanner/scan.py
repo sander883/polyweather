@@ -13,6 +13,7 @@ from polyweather.db.connection import get_conn
 from polyweather.fetchers.gfs_ensemble import (
     EnsembleForecast,
     fetch_gfs_ensemble,
+    load_members,
     persist_forecast,
 )
 from polyweather.model.probability import Bucket, bucket_probabilities
@@ -109,15 +110,16 @@ def _upsert_event(pe: ParsedEvent) -> tuple[int, dict[str, int]]:
             cur = conn.execute(
                 """
                 INSERT INTO markets
-                    (condition_id, slug, question, city_code,
+                    (condition_id, slug, question, city_code, market_type,
                      settle_time_utc, liquidity_usd, volume_usd, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pe.group_id,
                     None,
                     pe.title,
                     pe.city_code,
+                    pe.market_type,
                     pe.settle_time_utc.isoformat() if pe.settle_time_utc else None,
                     pe.liquidity_usd,
                     pe.volume_usd,
@@ -130,11 +132,14 @@ def _upsert_event(pe: ParsedEvent) -> tuple[int, dict[str, int]]:
             conn.execute(
                 """
                 UPDATE markets
-                   SET liquidity_usd = ?, volume_usd = ?, raw_json = ?,
-                       last_seen_at = datetime('now')
+                   SET market_type = ?, liquidity_usd = ?, volume_usd = ?,
+                       raw_json = ?, last_seen_at = datetime('now')
                  WHERE id = ?
                 """,
-                (pe.liquidity_usd, pe.volume_usd, json.dumps(pe.raw, default=str), market_id),
+                (
+                    pe.market_type, pe.liquidity_usd, pe.volume_usd,
+                    json.dumps(pe.raw, default=str), market_id,
+                ),
             )
 
         bucket_ids: dict[str, int] = {}
@@ -242,7 +247,8 @@ async def scan_once() -> dict:
             prob_buckets = [
                 Bucket(label=b.token_id, low=b.low, high=b.high) for b in pe.buckets
             ]
-            probs = bucket_probabilities(fc.daily_max_f_per_member, prob_buckets)
+            samples = fc.samples_for(pe.market_type)
+            probs = bucket_probabilities(samples, prob_buckets)
 
             market_id, bucket_id_map = _upsert_event(pe)
             forecast_id = _find_forecast_id(pe.city_code, target_iso)

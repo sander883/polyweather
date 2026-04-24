@@ -9,6 +9,7 @@ Shapes are modeled after the actual Gamma response observed in the wild:
 from polyweather.scanner.models import Event, Market
 from polyweather.scanner.parser import (
     detect_city,
+    detect_market_type,
     group_flat_markets,
     parse_bucket_label,
     parse_event,
@@ -102,6 +103,29 @@ def test_detect_city_prefers_longer_alias():
     assert detect_city("Alaska high temp") is None
 
 
+# ---------- market_type detection ----------
+
+def test_market_type_high():
+    assert detect_market_type("Highest temperature in NYC on April 25") == "high"
+    assert detect_market_type("Max temperature in Chicago today") == "high"
+
+
+def test_market_type_low():
+    assert detect_market_type("Lowest temperature in NYC on April 24") == "low"
+    assert detect_market_type("Min temperature in LAX") == "low"
+
+
+def test_market_type_precip():
+    assert detect_market_type("Precipitation in NYC in April?") == "precip"
+    assert detect_market_type("Rainfall in Chicago this week") == "precip"
+    assert detect_market_type("Snowfall in Boston") == "precip"
+
+
+def test_market_type_other():
+    assert detect_market_type("Wind speed in NYC") == "other"
+    assert detect_market_type("") == "other"
+
+
 # ---------- Event-based parsing ----------
 
 def test_parse_event_with_negrisk_group():
@@ -125,12 +149,47 @@ def test_parse_event_with_negrisk_group():
     pe = parse_event(event)
     assert pe is not None
     assert pe.city_code == "NYC"
+    assert pe.market_type == "high"
     assert pe.group_id == "0xgroup"
     assert len(pe.buckets) == 5
     labels = {b.outcome_label for b in pe.buckets}
     assert labels == {"Below 65", "65-69", "70-74", "75-79", "Above 80"}
     # liquidity should be sum across buckets
     assert pe.liquidity_usd == 5 * 1500
+
+
+def test_parse_event_lowest_temperature():
+    event_dict = {
+        "id": "evt_low",
+        "title": "Lowest temperature in NYC on April 24",
+        "active": True, "closed": False,
+        "endDate": "2026-04-24T23:59:59Z",
+        "markets": [
+            _binary_market("0xL1", "42-43", "0.05",
+                           question="Lowest temperature in NYC on April 24"),
+            _binary_market("0xL2", "50-51", "0.25",
+                           question="Lowest temperature in NYC on April 24"),
+        ],
+    }
+    event = Event.model_validate(event_dict)
+    pe = parse_event(event)
+    assert pe is not None
+    assert pe.market_type == "low"
+
+
+def test_parse_event_skips_precipitation():
+    event_dict = {
+        "id": "evt_precip",
+        "title": "Precipitation in NYC in April?",
+        "active": True, "closed": False,
+        "endDate": "2026-04-30T23:59:59Z",
+        "markets": [
+            _binary_market("0xP1", ">6\"", "0.01",
+                           question="Precipitation in NYC in April"),
+        ],
+    }
+    event = Event.model_validate(event_dict)
+    assert parse_event(event) is None
 
 
 def test_parse_event_skips_closed_markets_within_group():
@@ -170,12 +229,18 @@ def test_parse_event_skips_unknown_city():
 
 def test_group_flat_markets_by_neg_risk_id():
     flat = [
-        Market.model_validate(_binary_market("0xD1", "70-74", "0.30", "0xgroup_nyc",
-                                             question="NYC high temp")),
-        Market.model_validate(_binary_market("0xD2", "75-79", "0.25", "0xgroup_nyc",
-                                             question="NYC high temp")),
-        Market.model_validate(_binary_market("0xE1", "60-64", "0.40", "0xgroup_lax",
-                                             question="Los Angeles temp")),
+        Market.model_validate(_binary_market(
+            "0xD1", "70-74", "0.30", "0xgroup_nyc",
+            question="Highest temperature in NYC on April 25",
+        )),
+        Market.model_validate(_binary_market(
+            "0xD2", "75-79", "0.25", "0xgroup_nyc",
+            question="Highest temperature in NYC on April 25",
+        )),
+        Market.model_validate(_binary_market(
+            "0xE1", "60-64", "0.40", "0xgroup_lax",
+            question="Highest temperature in Los Angeles on April 25",
+        )),
     ]
     events = group_flat_markets(flat)
     assert len(events) == 2
@@ -183,3 +248,4 @@ def test_group_flat_markets_by_neg_risk_id():
     assert set(by_city) == {"NYC", "LAX"}
     assert len(by_city["NYC"].buckets) == 2
     assert len(by_city["LAX"].buckets) == 1
+    assert all(e.market_type == "high" for e in events)
