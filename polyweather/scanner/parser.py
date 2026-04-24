@@ -1,57 +1,61 @@
-"""Parse Polymarket weather market payloads into normalized city + buckets.
+"""Parse Polymarket events/markets into normalized weather trading targets.
 
-Polymarket weather questions come in a few common shapes:
+Weather markets on Polymarket are almost always shipped as **negRisk groups**:
+one logical event ("High temperature in NYC on April 25") contains many binary
+YES/NO markets, one per bucket. The bucket label lives in ``groupItemTitle``
+(e.g. ``"70-74"``, ``"Above 90°F"``), not in the question text. All markets in
+a group share the same ``negRiskMarketID``.
 
-    "Highest temperature in NYC on April 25?"                   (multi-outcome)
-    "Will the high in Los Angeles be above 75°F on April 25?"   (binary)
-    "NYC high between 70°F and 74°F on April 25?"               (binary range)
+This parser accepts either an Event (with nested markets) or a list of flat
+markets (we group them by ``negRiskMarketID`` ourselves).
 
-This parser is deliberately forgiving: if a market doesn't match a known
-pattern, we return ``None`` rather than guessing. Downstream code treats
-unparseable markets as skipped.
+Parsed output:
+
+    ParsedEvent
+    ├── condition_id             (negRiskMarketID or event id)
+    ├── question                 (event title / first market question)
+    ├── city_code                (detected from text)
+    ├── settle_time_utc
+    └── buckets[ParsedBucket]    one per binary market in the group
+        ├── token_id             (YES CLOB token id)
+        ├── outcome_label        (groupItemTitle)
+        ├── low / high           (parsed from the label)
+        └── yes_price            (implied YES probability)
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from polyweather.cities import CITIES
+from polyweather.scanner.models import Event, Market
 
 log = logging.getLogger(__name__)
 
-# Map common name forms to city codes
 _CITY_ALIASES: dict[str, str] = {
     "nyc": "NYC", "new york": "NYC", "new york city": "NYC", "jfk": "NYC",
     "los angeles": "LAX", "la": "LAX", "lax": "LAX",
-    "chicago": "ORD", "ord": "ORD",
+    "chicago": "ORD", "ord": "ORD", "midway": "ORD",
 }
 
-# Patterns we recognize in the question text
+# groupItemTitle patterns, °F assumed unless specified
 _RE_RANGE = re.compile(
-    r"between\s+(-?\d+(?:\.\d+)?)\s*°?\s*f?\s*(?:and|to|-)\s+(-?\d+(?:\.\d+)?)",
-    re.IGNORECASE,
+    r"^\s*(-?\d+(?:\.\d+)?)\s*°?\s*[fF]?\s*(?:to|-|–|—)\s*(-?\d+(?:\.\d+)?)\s*°?\s*[fF]?\s*$"
 )
 _RE_ABOVE = re.compile(
-    r"(?:above|over|more than|higher than|≥|>=|>)\s+(-?\d+(?:\.\d+)?)",
+    r"^\s*(?:above|over|≥|>=|>|at least|more than)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _RE_BELOW = re.compile(
-    r"(?:below|under|less than|lower than|≤|<=|<)\s+(-?\d+(?:\.\d+)?)",
+    r"^\s*(?:below|under|≤|<=|<|less than|at most|fewer than)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-_RE_EXACT_RANGE_OUTCOME = re.compile(
-    r"^\s*(-?\d+(?:\.\d+)?)\s*°?\s*f?\s*(?:to|-|–|—)\s*(-?\d+(?:\.\d+)?)\s*°?\s*f?\s*$",
-    re.IGNORECASE,
-)
-_RE_OUTCOME_ABOVE = re.compile(
-    r"^\s*(?:above|over|>)\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE
-)
-_RE_OUTCOME_BELOW = re.compile(
-    r"^\s*(?:below|under|<)\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE
+# Celsius bucket (climate anomaly markets often use °C)
+_RE_RANGE_C = re.compile(
+    r"^\s*(-?\d+(?:\.\d+)?)\s*°?\s*[cC]\s*(?:to|-|–|—)\s*(-?\d+(?:\.\d+)?)\s*°?\s*[cC]"
 )
 
 
@@ -62,166 +66,214 @@ class ParsedBucket:
     low: float | None
     high: float | None
     yes_price: float | None
+    condition_id: str              # per-binary condition id (for future order placement)
 
 
 @dataclass
-class ParsedMarket:
-    condition_id: str
-    slug: str | None
-    question: str
+class ParsedEvent:
+    group_id: str                  # negRiskMarketID or fallback event id
+    title: str
     city_code: str
     settle_time_utc: datetime | None
     liquidity_usd: float
     volume_usd: float
     buckets: list[ParsedBucket]
-    raw: dict
+    raw: dict                      # the original event dict (for DB storage)
 
 
-def _detect_city(text: str) -> str | None:
-    t = text.lower()
-    # Prefer longer aliases first to avoid "la" matching "los angeles"
+def detect_city(*texts: str | None) -> str | None:
+    blob = " ".join((t or "").lower() for t in texts if t)
+    if not blob:
+        return None
+    # Longer aliases first so "new york" wins over "nyc"; all matches
+    # are word-bounded so "la" does not match "Alaska" etc.
     for alias in sorted(_CITY_ALIASES, key=len, reverse=True):
-        if re.search(rf"\b{re.escape(alias)}\b", t):
+        pattern = rf"\b{re.escape(alias)}\b"
+        if re.search(pattern, blob):
             return _CITY_ALIASES[alias]
     for code in CITIES:
-        if re.search(rf"\b{code.lower()}\b", t):
+        if re.search(rf"\b{code.lower()}\b", blob):
             return code
     return None
 
 
-def _parse_bucket_from_outcome(outcome: str) -> tuple[float | None, float | None]:
-    """Parse a single outcome label like '70-74' or 'Above 80' into (low, high)."""
-    m = _RE_EXACT_RANGE_OUTCOME.match(outcome)
+def parse_bucket_label(label: str) -> tuple[float | None, float | None]:
+    """Parse ``groupItemTitle`` into (low, high) in °F.
+
+    Returns ``(None, None)`` if the label is unrecognized (caller should skip).
+    """
+    if not label:
+        return None, None
+    s = label.strip()
+
+    m = _RE_RANGE_C.match(s)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
         if lo > hi:
             lo, hi = hi, lo
-        return lo, hi + 1.0 if lo == hi else hi
-    m = _RE_OUTCOME_ABOVE.match(outcome)
-    if m:
-        return float(m.group(1)), None
-    m = _RE_OUTCOME_BELOW.match(outcome)
-    if m:
-        return None, float(m.group(1))
-    return None, None
+        return lo * 9 / 5 + 32, hi * 9 / 5 + 32
 
-
-def _parse_bucket_from_question(question: str) -> tuple[float | None, float | None]:
-    m = _RE_RANGE.search(question)
+    m = _RE_RANGE.match(s)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
         if lo > hi:
             lo, hi = hi, lo
+        # inclusive-inclusive on both ends in Polymarket labels; we treat as
+        # [low, high+1) for half-open bucket semantics when whole-degree.
+        if lo == hi:
+            hi = lo + 1.0
         return lo, hi
-    m = _RE_ABOVE.search(question)
+
+    m = _RE_ABOVE.match(s)
     if m:
         return float(m.group(1)), None
-    m = _RE_BELOW.search(question)
+    m = _RE_BELOW.match(s)
     if m:
         return None, float(m.group(1))
     return None, None
 
 
-def _as_list(value) -> list:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, list) else []
-        except json.JSONDecodeError:
-            return []
-    return []
-
-
-def _parse_settle_time(raw: dict) -> datetime | None:
-    for key in ("endDate", "end_date_iso", "endDateIso", "end_date", "closedTime"):
-        val = raw.get(key)
+def _parse_settle_time(*candidates: str | None) -> datetime | None:
+    for val in candidates:
         if not val:
             continue
         try:
-            return datetime.fromisoformat(str(val).replace("Z", "+00:00")).astimezone(timezone.utc)
+            return (
+                datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                .astimezone(timezone.utc)
+            )
         except (ValueError, TypeError):
             continue
     return None
 
 
-def _float(value, default: float = 0.0) -> float:
-    try:
-        return float(value) if value is not None else default
-    except (TypeError, ValueError):
-        return default
+def _market_is_usable(m: Market) -> bool:
+    if not m.is_tradable:
+        return False
+    if m.yes_price is None or m.yes_token_id is None:
+        return False
+    if not m.groupItemTitle:
+        return False
+    return True
 
 
-def parse_weather_market(raw: dict) -> ParsedMarket | None:
-    question = str(raw.get("question") or raw.get("title") or "").strip()
-    if not question:
+def parse_event(event: Event) -> ParsedEvent | None:
+    """Event-first parsing: iterate nested markets, keep usable ones."""
+    if not event.is_live:
         return None
 
-    city = _detect_city(question)
+    city = detect_city(event.title, event.description, event.slug)
     if not city:
         return None
 
-    token_ids = _as_list(raw.get("clobTokenIds"))
-    outcomes = _as_list(raw.get("outcomes"))
-    prices = _as_list(raw.get("outcomePrices"))
+    raw_markets = event.markets or []
+    if not raw_markets:
+        return None
 
     buckets: list[ParsedBucket] = []
+    liquidity = 0.0
+    volume = 0.0
+    group_id: str | None = None
+    settle: datetime | None = _parse_settle_time(event.endDate)
 
-    if len(outcomes) >= 2 and len(token_ids) == len(outcomes):
-        # Multi-outcome market — each outcome is a bucket
-        # Skip binary Yes/No markets; those need the range parsed from question
-        is_yes_no = {str(o).strip().lower() for o in outcomes} == {"yes", "no"}
-        if not is_yes_no:
-            for i, label in enumerate(outcomes):
-                lo, hi = _parse_bucket_from_outcome(str(label))
-                price = _float(prices[i], default=None) if i < len(prices) else None
-                buckets.append(
-                    ParsedBucket(
-                        token_id=str(token_ids[i]),
-                        outcome_label=str(label),
-                        low=lo,
-                        high=hi,
-                        yes_price=price,
-                    )
-                )
-        else:
-            # Binary market on a threshold / range
-            lo, hi = _parse_bucket_from_question(question)
-            if lo is None and hi is None:
-                return None
-            # YES token only — we treat this as a single bucket
-            yes_idx = next(
-                (i for i, o in enumerate(outcomes) if str(o).strip().lower() == "yes"),
-                0,
+    for m in raw_markets:
+        if not _market_is_usable(m):
+            continue
+        lo, hi = parse_bucket_label(m.groupItemTitle or "")
+        if lo is None and hi is None:
+            continue
+        if group_id is None and m.negRiskMarketID:
+            group_id = m.negRiskMarketID
+
+        buckets.append(
+            ParsedBucket(
+                token_id=m.yes_token_id or "",
+                outcome_label=m.groupItemTitle or "",
+                low=lo,
+                high=hi,
+                yes_price=m.yes_price,
+                condition_id=m.conditionId or "",
             )
-            price = _float(prices[yes_idx], default=None) if yes_idx < len(prices) else None
-            buckets.append(
-                ParsedBucket(
-                    token_id=str(token_ids[yes_idx]),
-                    outcome_label=f"YES ({question})",
-                    low=lo,
-                    high=hi,
-                    yes_price=price,
-                )
-            )
-    else:
-        log.debug("market %r has unusable outcomes shape", question[:60])
-        return None
+        )
+        liquidity += float(m.liquidityNum or m.liquidity or 0.0)
+        volume += float(m.volumeNum or m.volume or 0.0)
+        settle = settle or _parse_settle_time(m.endDateIso, m.endDate)
 
     if not buckets:
         return None
 
-    return ParsedMarket(
-        condition_id=str(raw.get("conditionId") or raw.get("condition_id") or raw.get("id") or ""),
-        slug=raw.get("slug"),
-        question=question,
+    return ParsedEvent(
+        group_id=group_id or str(event.id or event.slug or ""),
+        title=event.title or "",
         city_code=city,
-        settle_time_utc=_parse_settle_time(raw),
-        liquidity_usd=_float(raw.get("liquidity") or raw.get("liquidityNum")),
-        volume_usd=_float(raw.get("volume") or raw.get("volumeNum")),
+        settle_time_utc=settle,
+        liquidity_usd=liquidity,
+        volume_usd=volume,
         buckets=buckets,
-        raw=raw,
+        raw=event.model_dump(),
     )
+
+
+def group_flat_markets(markets: list[Market]) -> list[ParsedEvent]:
+    """Fallback: group flat markets by ``negRiskMarketID`` when we only have a
+    market-level listing.
+    """
+    by_group: dict[str, list[Market]] = {}
+    for m in markets:
+        key = m.negRiskMarketID or (str(m.conditionId) if m.conditionId else None)
+        if not key:
+            continue
+        by_group.setdefault(key, []).append(m)
+
+    out: list[ParsedEvent] = []
+    for group_id, ms in by_group.items():
+        usable = [m for m in ms if _market_is_usable(m)]
+        if not usable:
+            continue
+
+        title = usable[0].question or ""
+        descriptions = " ".join(m.description or "" for m in usable[:3])
+        slugs = " ".join(m.slug or "" for m in usable[:3])
+        city = detect_city(title, descriptions, slugs)
+        if not city:
+            continue
+
+        buckets: list[ParsedBucket] = []
+        liquidity = 0.0
+        volume = 0.0
+        settle: datetime | None = None
+
+        for m in usable:
+            lo, hi = parse_bucket_label(m.groupItemTitle or "")
+            if lo is None and hi is None:
+                continue
+            buckets.append(
+                ParsedBucket(
+                    token_id=m.yes_token_id or "",
+                    outcome_label=m.groupItemTitle or "",
+                    low=lo,
+                    high=hi,
+                    yes_price=m.yes_price,
+                    condition_id=m.conditionId or "",
+                )
+            )
+            liquidity += float(m.liquidityNum or m.liquidity or 0.0)
+            volume += float(m.volumeNum or m.volume or 0.0)
+            settle = settle or _parse_settle_time(m.endDateIso, m.endDate)
+
+        if not buckets:
+            continue
+
+        out.append(
+            ParsedEvent(
+                group_id=group_id,
+                title=title,
+                city_code=city,
+                settle_time_utc=settle,
+                liquidity_usd=liquidity,
+                volume_usd=volume,
+                buckets=buckets,
+                raw={"grouped_markets": [m.model_dump() for m in usable]},
+            )
+        )
+    return out

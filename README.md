@@ -6,13 +6,25 @@ Polymarket weather market trading bot. Paper-mode only in Phase 1.
 
 - Python 3.11+ / FastAPI / SQLite
 - Forecast: GFS 31-member ensemble via [Open-Meteo](https://open-meteo.com/)
-- Target venue: Polymarket (Gamma API + CLOB)
+- Target venue: Polymarket (Gamma API via httpx; `py-clob-client` reserved for Phase 3)
+
+## How Polymarket weather markets actually look
+
+Polymarket ships weather buckets as **negRisk groups**: one logical event
+(e.g. *Highest temperature in NYC on April 25*) contains many binary YES/NO
+markets, one per bucket. All share the same `negRiskMarketID`, and the bucket
+label lives in `groupItemTitle` (e.g. `"70-74"`, `"Above 80"`, `"1.24-1.30"`).
+
+Scanner discovery path:
+1. `/events?tag_slug=weather` (primary)
+2. Fallback tags: `temperature`, `climate`
+3. Last-resort free-text search on `/markets`, grouped by `negRiskMarketID`
 
 ## Phase 1 scope
 
 - GFS ensemble fetcher
-- Bucket-probability engine (baseline, GFS only)
-- Polymarket scanner (read-only, weather / temperature markets)
+- Bucket-probability engine (baseline, GFS only, Laplace smoothing)
+- Event-based Polymarket scanner (negRisk-aware, read-only)
 - Paper trading engine with Kelly-¼ sizing and hard caps
 - FastAPI with status / signals / positions / calibration endpoints
 

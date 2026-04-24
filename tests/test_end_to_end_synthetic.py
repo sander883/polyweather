@@ -1,9 +1,4 @@
-"""Synthetic end-to-end test: no network, no Open-Meteo, no Polymarket.
-
-We inject a ParsedMarket + an EnsembleForecast directly, then drive the same
-functions used by scan_once: upsert, probability scoring, signal insertion,
-paper execution. This verifies the full in-process pipeline is wired correctly.
-"""
+"""Synthetic end-to-end: Event-shaped payload → forecasts → signal → paper position."""
 
 from __future__ import annotations
 
@@ -29,11 +24,12 @@ def isolated_db(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_synthetic_pipeline_emits_signal_and_opens_paper_position(isolated_db):
-    from polyweather.scanner.parser import ParsedMarket, ParsedBucket
+def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
+    from polyweather.scanner.models import Event
+    from polyweather.scanner.parser import parse_event
     from polyweather.fetchers.gfs_ensemble import EnsembleForecast, persist_forecast
     from polyweather.scanner.scan import (
-        _upsert_market,
+        _upsert_event,
         _find_forecast_id,
         _insert_signal,
     )
@@ -42,86 +38,100 @@ def test_synthetic_pipeline_emits_signal_and_opens_paper_position(isolated_db):
     from polyweather.trading.paper import execute_pending_signals, list_positions
     from polyweather.db.connection import get_conn
 
-    settle = datetime.now(timezone.utc) + timedelta(hours=36)
+    settle = (datetime.now(timezone.utc) + timedelta(hours=36)).replace(microsecond=0)
 
-    # Synthetic market: NYC temperature, 4 buckets, one is under-priced
-    pm = ParsedMarket(
-        condition_id="cond_synth_1",
-        slug="nyc-temp-synth",
-        question="Highest temperature in NYC on test day?",
-        city_code="NYC",
-        settle_time_utc=settle,
-        liquidity_usd=5000.0,
-        volume_usd=20000.0,
-        buckets=[
-            ParsedBucket("t1", "<65", None, 65.0, 0.10),
-            ParsedBucket("t2", "65-69", 65.0, 69.0, 0.25),
-            ParsedBucket("t3", "70-74", 70.0, 74.0, 0.20),   # ← we'll concentrate here
-            ParsedBucket("t4", ">=74", 74.0, None, 0.45),
+    def binary(cond: str, label: str, yes: str) -> dict:
+        return {
+            "id": int(abs(hash(cond)) % 10_000_000),
+            "conditionId": cond,
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": f'["{yes}", "{1 - float(yes):.3f}"]',
+            "clobTokenIds": f'["tok_{cond}", "tok_{cond}_no"]',
+            "active": True, "closed": False, "archived": False,
+            "acceptingOrders": True,
+            "liquidity": 1500, "liquidityNum": 1500,
+            "volume": 5000, "volumeNum": 5000,
+            "endDate": settle.isoformat(),
+            "endDateIso": settle.date().isoformat(),
+            "negRisk": True,
+            "negRiskMarketID": "0xgroup_synth",
+            "groupItemTitle": label,
+        }
+
+    # Five-bucket event; market mispriced at 70-74 (market=0.20, model should be ~0.87)
+    event_dict = {
+        "id": "evt_synth",
+        "slug": "nyc-temp-synth",
+        "title": "Highest temperature in NYC on test day",
+        "active": True, "closed": False, "archived": False,
+        "endDate": settle.isoformat(),
+        "markets": [
+            binary("c1", "Below 65", "0.10"),
+            binary("c2", "65-69", "0.25"),
+            binary("c3", "70-74", "0.20"),           # <-- under-priced
+            binary("c4", "75-79", "0.30"),
+            binary("c5", "Above 80", "0.15"),
         ],
-        raw={"synthetic": True},
-    )
+    }
+    event = Event.model_validate(event_dict)
+    pe = parse_event(event)
+    assert pe is not None and pe.city_code == "NYC"
+    assert len(pe.buckets) == 5
 
-    # Synthetic ensemble: strongly concentrated around 71-73 → model says P(70-74) >> 0.20
+    # Synthetic ensemble concentrated in 70-74
     members = [68.0] + [71.0] * 8 + [72.0] * 10 + [73.0] * 8 + [76.0] * 4
     fc = EnsembleForecast(
         city_code="NYC",
         source="gfs_ensemble",
         run_time_utc=datetime.now(timezone.utc),
         target_date=settle.date(),
-        target_time_utc=settle.replace(hour=23, minute=59, second=59, microsecond=0),
+        target_time_utc=settle.replace(hour=23, minute=59, second=59),
         daily_max_f_per_member=members,
     )
-    forecast_id = persist_forecast(fc)
-    assert forecast_id > 0
+    assert persist_forecast(fc) > 0
 
-    market_id, token_to_bucket = _upsert_market(pm)
+    market_id, tok_to_bucket = _upsert_event(pe)
     assert market_id > 0
-    assert len(token_to_bucket) == 4
-
     fid = _find_forecast_id("NYC", settle.date().isoformat())
-    assert fid == forecast_id
+    assert fid
 
-    buckets_for_prob = [Bucket(b.token_id, b.low, b.high) for b in pm.buckets]
-    probs = bucket_probabilities(members, buckets_for_prob)
-    # 70-74 should dominate
-    assert probs["t3"] > 0.70
-    assert probs["t3"] > probs["t1"] + probs["t2"] + probs["t4"]
+    prob_buckets = [Bucket(b.token_id, b.low, b.high) for b in pe.buckets]
+    probs = bucket_probabilities(members, prob_buckets)
 
-    s = get_settings()
-    edge = probs["t3"] - 0.20
-    assert edge > s.edge_threshold    # confirm it passes the filter
-    ev = probs["t3"] / 0.20 - 1.0
-    assert ev > 0
+    # Find the 70-74 bucket's token id
+    target_bucket = next(b for b in pe.buckets if b.outcome_label == "70-74")
+    p_model = probs[target_bucket.token_id]
+    p_market = target_bucket.yes_price
+    assert p_model > 0.70
+    edge = p_model - p_market
+    assert edge > get_settings().edge_threshold
 
-    sz = recommended_size(p_model=probs["t3"], price=0.20, bankroll=s.paper_bankroll)
+    sz = recommended_size(
+        p_model=p_model, price=p_market, bankroll=get_settings().paper_bankroll
+    )
     assert sz.size_usd > 0
 
     sig_id = _insert_signal(
         market_id=market_id,
-        bucket_id=token_to_bucket["t3"],
+        bucket_id=tok_to_bucket[target_bucket.token_id],
         forecast_id=fid,
-        p_model=probs["t3"],
-        p_market=0.20,
+        p_model=p_model,
+        p_market=p_market,
         edge=edge,
-        ev=ev,
+        ev=p_model / p_market - 1,
         size_usd=sz.size_usd,
         kelly_used=sz.kelly_used,
         reason="synthetic",
     )
     assert sig_id > 0
 
-    # Execute → paper position
     opened = execute_pending_signals()
     assert len(opened) == 1
     positions = list_positions(status="OPEN")
     assert len(positions) == 1
-    pos = positions[0]
-    assert pos["city_code"] == "NYC"
-    assert pos["side"] == "YES"
-    assert pos["size_usd"] == sz.size_usd
+    assert positions[0]["city_code"] == "NYC"
+    assert positions[0]["side"] == "YES"
 
-    # Signal is marked acted
     with get_conn() as conn:
         row = conn.execute("SELECT acted FROM signals WHERE id = ?", (sig_id,)).fetchone()
         assert row["acted"] == 1

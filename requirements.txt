@@ -6,3 +6,7 @@ pydantic-settings==2.5.2
 python-dotenv==1.0.1
 numpy==2.1.1
 apscheduler==3.10.4
+
+# Polymarket official clients (used by Polymarket/agents). CLOB is for Phase 3
+# live execution; Phase 1/2 only needs the Gamma HTTP API (via httpx).
+py-clob-client==0.17.5

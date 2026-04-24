@@ -1,11 +1,10 @@
-"""Scan Polymarket weather markets, score against GFS ensemble, emit signals."""
+"""Scan Polymarket events → score buckets → emit paper-trade signals."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from dataclasses import asdict
 from datetime import datetime, timezone
 
 from polyweather.cities import CITIES
@@ -17,51 +16,70 @@ from polyweather.fetchers.gfs_ensemble import (
     persist_forecast,
 )
 from polyweather.model.probability import Bucket, bucket_probabilities
-from polyweather.scanner.parser import ParsedMarket, parse_weather_market
+from polyweather.scanner.parser import ParsedEvent, group_flat_markets, parse_event
 from polyweather.scanner.polymarket_client import GammaClient
 from polyweather.sizing.kelly import recommended_size
 
 log = logging.getLogger(__name__)
 
 
-async def _collect_markets(client: GammaClient) -> list[ParsedMarket]:
-    raw_markets: list[dict] = []
-    try:
-        raw_markets = await client.list_markets(tag="weather", limit=200)
-    except Exception as e:  # noqa: BLE001
-        log.warning("tag-based fetch failed: %s; falling back to search", e)
+async def _collect_events(client: GammaClient) -> list[ParsedEvent]:
+    parsed: list[ParsedEvent] = []
 
-    if not raw_markets:
-        for q in ("weather", "temperature", "high temperature"):
-            try:
-                raw_markets.extend(await client.search_markets(q, limit=100))
-            except Exception as e:  # noqa: BLE001
-                log.warning("search(%r) failed: %s", q, e)
-
-    # De-duplicate by conditionId
-    seen: set[str] = set()
-    parsed: list[ParsedMarket] = []
-    for raw in raw_markets:
-        cid = str(raw.get("conditionId") or raw.get("id") or "")
-        if cid in seen:
+    # Primary: tag-based event discovery.
+    for tag in ("weather", "temperature", "climate"):
+        try:
+            events = await client.list_events(tag_slug=tag, limit=100)
+        except Exception as e:  # noqa: BLE001
+            log.warning("list_events(tag=%s) failed: %s", tag, e)
             continue
-        seen.add(cid)
-        pm = parse_weather_market(raw)
-        if pm is not None:
-            parsed.append(pm)
-    log.info("parsed %d weather markets from %d raw", len(parsed), len(raw_markets))
-    return parsed
+        for ev in events:
+            pe = parse_event(ev)
+            if pe is not None:
+                parsed.append(pe)
+        if parsed:
+            break   # first tag that returns usable events wins
+
+    # Fallback: free-text market search, grouped by negRiskMarketID
+    if not parsed:
+        try:
+            flat: list = []
+            for q in ("temperature", "weather", "Fahrenheit", "Celsius"):
+                flat.extend(await client.search_markets(q, limit=100))
+            # de-dup by (conditionId, slug)
+            seen: set[str] = set()
+            uniq = []
+            for m in flat:
+                key = m.conditionId or m.slug or str(m.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(m)
+            parsed = group_flat_markets(uniq)
+        except Exception as e:  # noqa: BLE001
+            log.warning("market fallback failed: %s", e)
+
+    # de-dup by group_id
+    seen_groups: set[str] = set()
+    dedup: list[ParsedEvent] = []
+    for pe in parsed:
+        if pe.group_id in seen_groups:
+            continue
+        seen_groups.add(pe.group_id)
+        dedup.append(pe)
+
+    log.info("discovered %d parseable weather events", len(dedup))
+    return dedup
 
 
-async def _forecasts_for_markets(
-    markets: list[ParsedMarket],
+async def _forecasts_for_events(
+    events: list[ParsedEvent],
 ) -> dict[tuple[str, str], EnsembleForecast]:
-    """Fetch one ensemble forecast per (city, target_date) we need."""
     targets: set[tuple[str, str]] = set()
-    for m in markets:
-        if m.settle_time_utc is None:
+    for e in events:
+        if e.settle_time_utc is None:
             continue
-        targets.add((m.city_code, m.settle_time_utc.date().isoformat()))
+        targets.add((e.city_code, e.settle_time_utc.date().isoformat()))
 
     out: dict[tuple[str, str], EnsembleForecast] = {}
 
@@ -78,11 +96,13 @@ async def _forecasts_for_markets(
     return out
 
 
-def _upsert_market(pm: ParsedMarket) -> tuple[int, dict[str, int]]:
-    """Insert/refresh market + buckets. Returns (market_id, token_id -> bucket_id)."""
+def _upsert_event(pe: ParsedEvent) -> tuple[int, dict[str, int]]:
+    """Insert/refresh the logical event row (stored in ``markets`` table) and
+    its bucket rows. Returns (market_id, token_id → bucket_id).
+    """
     with get_conn() as conn:
         cur = conn.execute(
-            "SELECT id FROM markets WHERE condition_id = ?", (pm.condition_id,)
+            "SELECT id FROM markets WHERE condition_id = ?", (pe.group_id,)
         )
         row = cur.fetchone()
         if row is None:
@@ -94,14 +114,14 @@ def _upsert_market(pm: ParsedMarket) -> tuple[int, dict[str, int]]:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    pm.condition_id,
-                    pm.slug,
-                    pm.question,
-                    pm.city_code,
-                    pm.settle_time_utc.isoformat() if pm.settle_time_utc else None,
-                    pm.liquidity_usd,
-                    pm.volume_usd,
-                    json.dumps(pm.raw),
+                    pe.group_id,
+                    None,
+                    pe.title,
+                    pe.city_code,
+                    pe.settle_time_utc.isoformat() if pe.settle_time_utc else None,
+                    pe.liquidity_usd,
+                    pe.volume_usd,
+                    json.dumps(pe.raw, default=str),
                 ),
             )
             market_id = int(cur.lastrowid)
@@ -114,11 +134,11 @@ def _upsert_market(pm: ParsedMarket) -> tuple[int, dict[str, int]]:
                        last_seen_at = datetime('now')
                  WHERE id = ?
                 """,
-                (pm.liquidity_usd, pm.volume_usd, json.dumps(pm.raw), market_id),
+                (pe.liquidity_usd, pe.volume_usd, json.dumps(pe.raw, default=str), market_id),
             )
 
         bucket_ids: dict[str, int] = {}
-        for b in pm.buckets:
+        for b in pe.buckets:
             conn.execute(
                 """
                 INSERT INTO market_buckets
@@ -140,9 +160,7 @@ def _upsert_market(pm: ParsedMarket) -> tuple[int, dict[str, int]]:
     return market_id, bucket_ids
 
 
-def _find_forecast_id(
-    city_code: str, target_date_iso: str
-) -> int | None:
+def _find_forecast_id(city_code: str, target_date_iso: str) -> int | None:
     with get_conn() as conn:
         row = conn.execute(
             """
@@ -189,7 +207,7 @@ def _insert_signal(
 
 
 async def scan_once() -> dict:
-    """One pass: fetch markets → forecasts → score → emit signals. Paper only."""
+    """One pass: fetch events → forecasts → score → emit signals. Paper only."""
     s = get_settings()
     started = datetime.now(timezone.utc)
     with get_conn() as conn:
@@ -202,34 +220,34 @@ async def scan_once() -> dict:
 
     try:
         client = GammaClient()
-        markets = await _collect_markets(client)
-        markets_seen = len(markets)
-        forecasts = await _forecasts_for_markets(markets)
+        events = await _collect_events(client)
+        markets_seen = len(events)
+        forecasts = await _forecasts_for_events(events)
 
-        for pm in markets:
-            if pm.settle_time_utc is None:
+        for pe in events:
+            if pe.settle_time_utc is None:
                 continue
-            target_iso = pm.settle_time_utc.date().isoformat()
-            fc = forecasts.get((pm.city_code, target_iso))
+            target_iso = pe.settle_time_utc.date().isoformat()
+            fc = forecasts.get((pe.city_code, target_iso))
             if fc is None:
                 continue
 
             now_utc = datetime.now(timezone.utc)
-            hours_to_settle = (pm.settle_time_utc - now_utc).total_seconds() / 3600.0
+            hours_to_settle = (pe.settle_time_utc - now_utc).total_seconds() / 3600.0
             if hours_to_settle < s.min_time_to_settle_hours:
                 continue
-            if pm.liquidity_usd < s.min_liquidity:
+            if pe.liquidity_usd < s.min_liquidity:
                 continue
 
-            buckets = [
-                Bucket(label=b.token_id, low=b.low, high=b.high) for b in pm.buckets
+            prob_buckets = [
+                Bucket(label=b.token_id, low=b.low, high=b.high) for b in pe.buckets
             ]
-            probs = bucket_probabilities(fc.daily_max_f_per_member, buckets)
+            probs = bucket_probabilities(fc.daily_max_f_per_member, prob_buckets)
 
-            market_id, bucket_id_map = _upsert_market(pm)
-            forecast_id = _find_forecast_id(pm.city_code, target_iso)
+            market_id, bucket_id_map = _upsert_event(pe)
+            forecast_id = _find_forecast_id(pe.city_code, target_iso)
 
-            for b in pm.buckets:
+            for b in pe.buckets:
                 if b.yes_price is None or b.yes_price <= 0 or b.yes_price >= 1:
                     continue
                 p_model = probs.get(b.token_id, 0.0)
@@ -268,7 +286,7 @@ async def scan_once() -> dict:
                 signals_emitted += 1
                 log.info(
                     "signal: %s [%s] %s → %s",
-                    pm.city_code, pm.question[:60], b.outcome_label, reason,
+                    pe.city_code, pe.title[:60], b.outcome_label, reason,
                 )
     except Exception as e:  # noqa: BLE001
         error = f"{type(e).__name__}: {e}"
@@ -288,7 +306,7 @@ async def scan_once() -> dict:
     return {
         "run_id": run_id,
         "started_at": started.isoformat(),
-        "markets_seen": markets_seen,
+        "events_seen": markets_seen,
         "signals_emitted": signals_emitted,
         "cities_tracked": sorted(CITIES),
         "error": error,
