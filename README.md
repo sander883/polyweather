@@ -47,6 +47,15 @@ Then:
 - `GET /signals` — current paper-trading signals
 - `GET /positions` — open paper positions
 - `POST /scan` — trigger an ad-hoc scan
+- `POST /settle` — resolve any settled paper positions
+- `GET /scheduler` — background-scheduler status
+
+## Background scheduler
+
+When `POLYWEATHER_SCHEDULER_ENABLED=true` (the default), uvicorn runs scan
+and settle on a recurring interval — drop it under `screen` / `nohup` /
+`systemd` and walk away. Manual `POST /scan` and `POST /settle` continue to
+work for ad-hoc testing.
 
 ## Layout
 

@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     overconfidence_threshold: float = 0.85
     overconfidence_kelly_multiplier: float = 0.5
 
+    # Background scheduler — runs scan + settle automatically when uvicorn
+    # is up. Set scheduler_enabled=false to disable (manual /scan + /settle
+    # still work).
+    scheduler_enabled: bool = True
+    scheduler_scan_minutes: int = 30
+    scheduler_settle_minutes: int = 30
+    scheduler_run_on_startup: bool = True
+    scheduler_auto_execute: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

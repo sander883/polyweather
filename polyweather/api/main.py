@@ -24,6 +24,11 @@ from polyweather.logging_setup import setup_logging
 from polyweather.model.calibration import reliability_bins
 from polyweather.model.probability import summary_stats
 from polyweather.scanner.scan import scan_once
+from polyweather.scheduler import (
+    scheduler_status,
+    start_scheduler,
+    stop_scheduler,
+)
 from polyweather.trading.paper import (
     bankroll_summary,
     execute_pending_signals,
@@ -36,7 +41,11 @@ from polyweather.trading.resolver import settle_open_positions
 async def lifespan(app: FastAPI):  # noqa: ARG001
     setup_logging()
     init_db()
-    yield
+    start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
 
 
 app = FastAPI(title="polyweather", version=__version__, lifespan=lifespan)
@@ -217,6 +226,11 @@ async def trigger_settle(
     a calibration row. Safe to call repeatedly.
     """
     return await settle_open_positions(only_past_settle=only_past_settle)
+
+
+@app.get("/scheduler")
+def scheduler() -> dict:
+    return scheduler_status()
 
 
 @app.get("/scans")
