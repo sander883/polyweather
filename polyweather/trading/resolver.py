@@ -1,33 +1,30 @@
 """Settle open paper positions by re-reading each market's final prices.
 
-After a Polymarket market resolves, the winning YES token trades at 1.00 and
-the losing ones at 0. We poll the market again via Gamma. For each open paper
-position we hold, we look up the current ``outcomePrices[yes]`` of the binary
-market that owns the position's ``bucket.token_id``.
+A Polymarket weather event is a negRisk group of binary markets. When the
+event resolves, the winning bucket's YES token trades at ~1.0 and all losers
+at ~0.0. We identify each open position's binary market by its CLOB token id
+(stored at signal time in ``market_buckets.token_id``), batch-fetch their
+current state via Gamma, group them by ``negRiskMarketID``, and:
 
-Resolution rule:
-    exit_price = current YES price (≈ 1.0 if bucket won, ≈ 0.0 if it lost)
-    pnl_usd   = shares * exit_price  -  size_usd
-
-We also record a ``calibration_records`` row per settled position so the
-reliability curve stays fresh.
+- if the group is fully resolved (exactly one bucket near 1.0, rest near 0)
+  → close every matching open paper position, write a calibration record;
+- otherwise → leave positions OPEN and report the current YES price as a
+  diagnostic so the caller can see what's happening.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 
 from polyweather.db.connection import get_conn
-from polyweather.scanner.models import Event, Market
+from polyweather.scanner.models import Market
 from polyweather.scanner.polymarket_client import GammaClient
 
 log = logging.getLogger(__name__)
 
-# Treat a YES price within this epsilon of 1.0 (or 0.0) as a final settlement.
-# Before resolution some markets briefly trade at 0.99 / 0.01 — we still count
-# them but flag the outcome as tentative.
+# A market is treated as "resolved" when one bucket is within this much of 1.0
+# and every other bucket is within this much of 0.0.
 _WIN_EPS = 0.02
 
 
@@ -47,50 +44,6 @@ def _open_positions() -> list[dict]:
             """
         ).fetchall()
     return [dict(r) for r in rows]
-
-
-async def _fetch_current_market(client: GammaClient, condition_id: str) -> Event | None:
-    """Re-read the event that owns this group so we see refreshed prices."""
-    events = await client.list_events(
-        tag_slug=None, active=False, closed=False, archived=False, limit=200
-    )
-    # The same negRiskMarketID groups many condition_ids; search for any
-    # event that has a market whose conditionId equals ours *or* whose
-    # negRiskMarketID equals ours.
-    for ev in events:
-        for m in ev.markets or []:
-            if m.conditionId == condition_id or m.negRiskMarketID == condition_id:
-                return ev
-    # Fallback: try with closed=true (market already resolved)
-    events = await client.list_events(
-        tag_slug=None, active=False, closed=True, archived=False, limit=200
-    )
-    for ev in events:
-        for m in ev.markets or []:
-            if m.conditionId == condition_id or m.negRiskMarketID == condition_id:
-                return ev
-    return None
-
-
-def _current_yes_price(event: Event, token_id: str) -> float | None:
-    for m in event.markets or []:
-        if m.yes_token_id == token_id:
-            return m.yes_price
-    return None
-
-
-def _market_is_resolved(event: Event) -> bool:
-    """An event is fully resolved when exactly one bucket is near 1.0."""
-    yes_prices = []
-    for m in event.markets or []:
-        if m.yes_price is not None:
-            yes_prices.append(m.yes_price)
-    if not yes_prices:
-        return False
-    near_one = sum(1 for p in yes_prices if p >= 1 - _WIN_EPS)
-    near_zero = sum(1 for p in yes_prices if p <= _WIN_EPS)
-    # Resolved: exactly one bucket near 1, rest near 0
-    return near_one == 1 and near_one + near_zero == len(yes_prices)
 
 
 def _close_position(
@@ -128,10 +81,26 @@ def _close_position(
     return pnl
 
 
+def _group_key(m: Market) -> str:
+    """Group binaries by negRiskMarketID; fall back to the market's own
+    conditionId for non-negRisk events.
+    """
+    return m.negRiskMarketID or m.conditionId or str(m.id or "")
+
+
+def _group_is_resolved(group: list[Market]) -> bool:
+    yes_prices = [m.yes_price for m in group if m.yes_price is not None]
+    if not yes_prices:
+        return False
+    near_one = sum(1 for p in yes_prices if p >= 1 - _WIN_EPS)
+    near_zero = sum(1 for p in yes_prices if p <= _WIN_EPS)
+    return near_one == 1 and near_one + near_zero == len(yes_prices)
+
+
 async def settle_open_positions(*, only_past_settle: bool = True) -> dict:
     """Resolve all open paper positions whose underlying market has settled.
 
-    Returns a summary dict with counts and PnL.
+    Returns a summary dict with counts, PnL, and per-group diagnostics.
     """
     positions = _open_positions()
     if not positions:
@@ -143,85 +112,95 @@ async def settle_open_positions(*, only_past_settle: bool = True) -> dict:
     now = datetime.now(timezone.utc)
     client = GammaClient()
 
-    # Group positions by condition_id so we fetch each event once
-    by_cond: dict[str, list[dict]] = {}
-    for p in positions:
-        by_cond.setdefault(p["condition_id"], []).append(p)
+    # Batch-fetch every binary market we have a position in by its token id
+    token_ids = sorted({p["token_id"] for p in positions if p.get("token_id")})
+    fetched = await client.get_markets_by_token_ids(token_ids)
+
+    # Index fetched markets by token id (each Market has its YES token id)
+    by_token: dict[str, Market] = {}
+    for m in fetched:
+        tid = m.yes_token_id
+        if tid:
+            by_token[tid] = m
+
+    # Group fetched markets by negRiskMarketID (the logical event)
+    by_group: dict[str, list[Market]] = {}
+    for m in fetched:
+        by_group.setdefault(_group_key(m), []).append(m)
 
     closed_count = 0
     still_open = 0
     total_pnl = 0.0
     details: list[dict] = []
 
-    for cond_id, group in by_cond.items():
+    for p in positions:
+        token_id = p["token_id"]
         # Optional guard: skip positions whose settle time is still in the future
-        if only_past_settle:
-            settle_str = group[0].get("settle_time_utc")
-            if settle_str:
-                try:
-                    settle_dt = datetime.fromisoformat(settle_str.replace("Z", "+00:00"))
-                    if settle_dt > now:
-                        still_open += len(group)
-                        details.append({
-                            "condition_id": cond_id,
-                            "skipped": "settle_time in future",
-                            "settle_time_utc": settle_str,
-                            "positions": len(group),
-                        })
-                        continue
-                except ValueError:
-                    pass
+        if only_past_settle and p.get("settle_time_utc"):
+            try:
+                settle_dt = datetime.fromisoformat(
+                    str(p["settle_time_utc"]).replace("Z", "+00:00")
+                )
+                if settle_dt > now:
+                    still_open += 1
+                    details.append({
+                        "position_id": p["id"], "city_code": p["city_code"],
+                        "outcome_label": p["outcome_label"],
+                        "skipped": "settle_time in future",
+                        "settle_time_utc": p["settle_time_utc"],
+                    })
+                    continue
+            except ValueError:
+                pass
 
-        try:
-            event = await _fetch_current_market(client, cond_id)
-        except Exception as e:  # noqa: BLE001
-            log.warning("resolver fetch failed for %s: %s", cond_id, e)
-            still_open += len(group)
-            details.append({"condition_id": cond_id, "error": str(e)})
-            continue
-
-        if event is None:
-            still_open += len(group)
-            details.append({"condition_id": cond_id, "skipped": "event not found"})
-            continue
-
-        resolved = _market_is_resolved(event)
-        for p in group:
-            yes_price = _current_yes_price(event, p["token_id"])
-            if yes_price is None:
-                still_open += 1
-                details.append({
-                    "position_id": p["id"], "skipped": "token not found in event",
-                })
-                continue
-            if not resolved:
-                still_open += 1
-                details.append({
-                    "position_id": p["id"],
-                    "skipped": "event not fully resolved",
-                    "current_yes_price": yes_price,
-                })
-                continue
-
-            pnl = _close_position(
-                position_id=p["id"],
-                exit_price=yes_price,
-                shares=p["shares"],
-                size_usd=p["size_usd"],
-                bucket_id=p["bucket_id"],
-                market_id=p["market_id"],
-                p_model=p["p_model_at_entry"],
-            )
-            total_pnl += pnl
-            closed_count += 1
+        m = by_token.get(token_id)
+        if m is None:
+            still_open += 1
             details.append({
-                "position_id": p["id"],
-                "city_code": p["city_code"],
+                "position_id": p["id"], "city_code": p["city_code"],
                 "outcome_label": p["outcome_label"],
-                "exit_price": round(yes_price, 4),
-                "pnl_usd": round(pnl, 2),
-                "result": "WIN" if yes_price >= 1 - _WIN_EPS else "LOSS",
+                "skipped": "binary market not returned by Gamma",
+                "token_id": token_id,
             })
+            continue
+
+        group_key = _group_key(m)
+        group = by_group.get(group_key, [])
+        resolved = _group_is_resolved(group)
+
+        if not resolved:
+            still_open += 1
+            details.append({
+                "position_id": p["id"], "city_code": p["city_code"],
+                "outcome_label": p["outcome_label"],
+                "skipped": "event not yet resolved",
+                "current_yes_price": m.yes_price,
+                "group_size": len(group),
+                "near_one": sum(1 for x in group if (x.yes_price or 0) >= 1 - _WIN_EPS),
+                "is_closed_flag": m.closed,
+            })
+            continue
+
+        exit_price = m.yes_price if m.yes_price is not None else 0.0
+        pnl = _close_position(
+            position_id=p["id"],
+            exit_price=exit_price,
+            shares=p["shares"],
+            size_usd=p["size_usd"],
+            bucket_id=p["bucket_id"],
+            market_id=p["market_id"],
+            p_model=p["p_model_at_entry"],
+        )
+        total_pnl += pnl
+        closed_count += 1
+        details.append({
+            "position_id": p["id"],
+            "city_code": p["city_code"],
+            "outcome_label": p["outcome_label"],
+            "exit_price": round(exit_price, 4),
+            "pnl_usd": round(pnl, 2),
+            "result": "WIN" if exit_price >= 1 - _WIN_EPS else "LOSS",
+        })
 
     return {
         "checked": len(positions),

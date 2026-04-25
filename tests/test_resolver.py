@@ -135,27 +135,26 @@ def test_close_position_records_loss(isolated_db):
     assert cal["outcome"] == 0
 
 
-def test_market_is_resolved_detection():
-    from polyweather.scanner.models import Event, Market
-    from polyweather.trading.resolver import _market_is_resolved
+def test_group_is_resolved_detection():
+    from polyweather.scanner.models import Market
+    from polyweather.trading.resolver import _group_is_resolved
 
-    def mk(yes: float) -> dict:
-        return {
+    def mk(yes: float, token: str = "tok") -> Market:
+        return Market.model_validate({
             "id": 1, "conditionId": f"0x{yes}",
             "outcomes": '["Yes","No"]',
             "outcomePrices": f'["{yes}", "{1-yes}"]',
-            "clobTokenIds": '["a","b"]',
+            "clobTokenIds": f'["{token}","no_{token}"]',
             "active": True, "closed": False, "acceptingOrders": True,
-        }
+            "negRiskMarketID": "0xgroup",
+        })
 
-    resolved = Event.model_validate({
-        "id": "e", "title": "x", "active": True, "closed": False,
-        "markets": [mk(0.0), mk(0.0), mk(1.0), mk(0.0)],
-    })
-    assert _market_is_resolved(resolved)
+    resolved = [mk(0.0, "a"), mk(0.0, "b"), mk(1.0, "c"), mk(0.0, "d")]
+    assert _group_is_resolved(resolved)
 
-    in_flight = Event.model_validate({
-        "id": "e", "title": "x", "active": True, "closed": False,
-        "markets": [mk(0.1), mk(0.3), mk(0.4), mk(0.2)],
-    })
-    assert not _market_is_resolved(in_flight)
+    in_flight = [mk(0.1, "a"), mk(0.3, "b"), mk(0.4, "c"), mk(0.2, "d")]
+    assert not _group_is_resolved(in_flight)
+
+    # Edge: only winner present (single-outcome group) — still resolved
+    only_winner = [mk(0.99, "a")]
+    assert _group_is_resolved(only_winner)

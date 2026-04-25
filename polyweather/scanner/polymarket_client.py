@@ -109,3 +109,31 @@ class GammaClient:
             except ValidationError:
                 continue
         return out
+
+    async def get_markets_by_token_ids(self, token_ids: list[str]) -> list[Market]:
+        """Fetch the current state of binary markets keyed by CLOB token id.
+
+        We don't filter by ``active`` / ``closed`` here — a settled market is
+        ``closed=true`` and we still need its final ``outcomePrices``.
+        """
+        if not token_ids:
+            return []
+        out: list[Market] = []
+        # Some Gamma responses cap the param length; chunk to be safe.
+        for i in range(0, len(token_ids), 50):
+            chunk = token_ids[i : i + 50]
+            params = {
+                "clob_token_ids": ",".join(chunk),
+                "limit": len(chunk),
+            }
+            try:
+                raw = self._as_list(await self._get("/markets", params=params))
+            except Exception as e:  # noqa: BLE001
+                log.warning("token-id fetch failed for chunk %d: %s", i, e)
+                continue
+            for item in raw:
+                try:
+                    out.append(Market.model_validate(item))
+                except ValidationError as e:
+                    log.debug("market parse failed: %s", e)
+        return out
