@@ -187,8 +187,21 @@ async def settle_open_positions(*, only_past_settle: bool = True) -> dict:
             })
             continue
 
-        resolved = _group_is_resolved(group)
-        if not resolved:
+        # Two paths to "resolved":
+        # 1) The whole group is settled (one near 1, rest near 0).
+        # 2) Just this binary is closed=true with a near-0 / near-1 price —
+        #    that's enough to settle our position even if the group fetch was
+        #    incomplete (Polymarket pagination / archival can drop sibling
+        #    binaries).
+        binary_settled = (
+            binary.closed
+            and binary.yes_price is not None
+            and (
+                binary.yes_price <= _WIN_EPS
+                or binary.yes_price >= 1 - _WIN_EPS
+            )
+        )
+        if not (_group_is_resolved(group) or binary_settled):
             still_open += 1
             details.append({
                 "position_id": p["id"], "city_code": p["city_code"],
