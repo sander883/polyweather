@@ -14,6 +14,25 @@ from polyweather.db.connection import get_conn
 log = logging.getLogger(__name__)
 
 
+def _has_open_position(market_id: int, bucket_id: int) -> bool:
+    """True if there's already an OPEN paper position on this exact bucket.
+
+    We avoid stacking duplicate positions when /scan is triggered repeatedly
+    (each scan emits a fresh signal row, but only one position should exist
+    per market+bucket until it settles).
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM paper_positions
+             WHERE market_id = ? AND bucket_id = ? AND status = 'OPEN'
+             LIMIT 1
+            """,
+            (market_id, bucket_id),
+        ).fetchone()
+    return row is not None
+
+
 def _city_exposure_today(city_code: str) -> float:
     with get_conn() as conn:
         row = conn.execute(
@@ -54,6 +73,13 @@ def open_paper_position(
     p_model: float,
 ) -> int | None:
     s = get_settings()
+    if _has_open_position(market_id, bucket_id):
+        with get_conn() as conn:
+            conn.execute("UPDATE signals SET acted = 1 WHERE id = ?", (signal_id,))
+        log.info("skip signal %d: open position already exists on this bucket",
+                 signal_id)
+        return None
+
     in_market = _market_exposure(market_id)
     in_city = _city_exposure_today(city_code)
 

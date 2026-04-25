@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     ensemble_members: int = 31
     laplace_alpha: float = 0.5
 
+    # Day-1 calibration learnings (see commit log):
+    # - tail buckets priced near zero are noise, not alpha → skip
+    # - very-high model confidence is suspicious until we have enough
+    #   calibration data, so halve the Kelly fraction in that regime.
+    min_p_market: float = 0.01
+    overconfidence_threshold: float = 0.85
+    overconfidence_kelly_multiplier: float = 0.5
+
 
 @lru_cache
 def get_settings() -> Settings:

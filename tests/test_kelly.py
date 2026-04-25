@@ -36,3 +36,17 @@ def test_recommended_size_respects_market_cap():
         already_in_market_usd=40.0,  # 8% of 500 = 40 → market remaining 0
     )
     assert r.size_usd == 0.0
+
+
+def test_overconfidence_dampener_halves_kelly():
+    # p=0.84 is below the 0.85 threshold, so it gets the full ¼ Kelly.
+    # p=0.95 is over the threshold, so its Kelly fraction is halved (×0.5).
+    # Compare kelly_used / kelly_full ratios to neutralize differing f*.
+    safe = recommended_size(p_model=0.84, price=0.40, bankroll=10_000.0)
+    over = recommended_size(p_model=0.95, price=0.40, bankroll=10_000.0)
+
+    safe_ratio = safe.kelly_used / safe.kelly_full
+    over_ratio = over.kelly_used / over.kelly_full
+
+    assert abs(safe_ratio - 0.25) < 1e-9
+    assert abs(over_ratio - 0.125) < 1e-9   # 0.25 × 0.5 dampener

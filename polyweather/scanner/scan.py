@@ -256,6 +256,11 @@ async def scan_once() -> dict:
             for b in pe.buckets:
                 if b.yes_price is None or b.yes_price <= 0 or b.yes_price >= 1:
                     continue
+                if b.yes_price < s.min_p_market:
+                    # Buckets priced near zero produce huge nominal EV that's
+                    # mostly noise — Day-1 calibration showed these tails
+                    # don't pay off enough to justify the position.
+                    continue
                 p_model = probs.get(b.token_id, 0.0)
                 edge = p_model - b.yes_price
                 if edge < s.edge_threshold:

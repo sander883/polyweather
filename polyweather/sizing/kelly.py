@@ -41,7 +41,12 @@ def recommended_size(
 ) -> SizingResult:
     s = get_settings()
     f_star = kelly_fraction(p_model, price)
-    f_used = f_star * s.kelly_fraction
+    fraction = s.kelly_fraction
+    if p_model >= s.overconfidence_threshold:
+        # Until we have enough calibration data to trust very-high p_model
+        # values, dampen the Kelly fraction to limit blast radius.
+        fraction *= s.overconfidence_kelly_multiplier
+    f_used = f_star * fraction
 
     by_kelly = f_used * bankroll
     by_trade = s.max_pct_per_trade * bankroll
