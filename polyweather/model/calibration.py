@@ -34,16 +34,39 @@ def record_outcome(
         return int(cur.lastrowid)
 
 
-def reliability_bins(n_bins: int = 10) -> list[ReliabilityBin]:
+def reliability_bins(
+    n_bins: int = 10,
+    min_p_market: float | None = None,
+) -> list[ReliabilityBin]:
+    """Compute reliability bins from settled positions.
+
+    When ``min_p_market`` is set we only include records whose entry price
+    (= the market's implied YES probability) is above the floor. This drops
+    tail bets (e.g. p_market < 0.05) from the calibration view so the curve
+    reflects realistic trading conditions instead of low-information lottery
+    tickets.
+    """
     bins: list[tuple[float, float, list[float], list[int]]] = []
     step = 1.0 / n_bins
     for i in range(n_bins):
         bins.append((i * step, (i + 1) * step, [], []))
 
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT p_model, outcome FROM calibration_records"
-        ).fetchall()
+        if min_p_market is not None:
+            rows = conn.execute(
+                """
+                SELECT cr.p_model, cr.outcome
+                  FROM calibration_records cr
+                  JOIN paper_positions pp
+                    ON pp.market_id = cr.market_id AND pp.bucket_id = cr.bucket_id
+                 WHERE pp.entry_price >= ?
+                """,
+                (min_p_market,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT p_model, outcome FROM calibration_records"
+            ).fetchall()
 
     for row in rows:
         p = float(row["p_model"])

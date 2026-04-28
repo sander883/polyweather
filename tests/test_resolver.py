@@ -73,8 +73,9 @@ def test_close_position_records_win(isolated_db):
         p_model=0.70,
     )
 
-    # Winning YES at 1.0: shares * 1.0 - size_usd = 75 - 15 = 60
-    assert pnl == 60.0
+    # Winning YES at 1.0 with 5% taker fee:
+    #   shares*1.0 − size_usd − size_usd*0.05 = 75 − 15 − 0.75 = 59.25
+    assert pnl == 59.25
 
     with get_conn() as conn:
         pos = conn.execute(
@@ -87,7 +88,7 @@ def test_close_position_records_win(isolated_db):
 
     assert pos["status"] == "SETTLED"
     assert pos["exit_price"] == 1.0
-    assert pos["pnl_usd"] == 60.0
+    assert pos["pnl_usd"] == 59.25
     assert len(cal) == 1
     assert cal[0]["p_model"] == 0.70
     assert cal[0]["outcome"] == 1
@@ -126,7 +127,8 @@ def test_close_position_records_loss(isolated_db):
         shares=50.0, size_usd=20.0,
         bucket_id=bucket_id, market_id=market_id, p_model=0.55,
     )
-    assert pnl == -20.0
+    # Loss with 5% taker fee on entry: −size_usd − size_usd*0.05 = −21.0
+    assert pnl == -21.0
 
     with get_conn() as conn:
         cal = conn.execute(

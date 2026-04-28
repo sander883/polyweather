@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from polyweather.config import get_settings
 from polyweather.db.connection import get_conn
 from polyweather.scanner.models import Event, Market
 from polyweather.scanner.polymarket_client import GammaClient
@@ -53,7 +54,11 @@ def _close_position(
     market_id: int,
     p_model: float,
 ) -> float:
-    pnl = shares * exit_price - size_usd
+    # Subtract a flat taker fee on the entry size so paper PnL reflects the
+    # cost of crossing Polymarket's order book. Conservative: deducted on
+    # both winners and losers (entry fee was paid regardless of outcome).
+    fee = size_usd * get_settings().simulated_fee_pct
+    pnl = shares * exit_price - size_usd - fee
     won = exit_price >= 1 - _WIN_EPS
     with get_conn() as conn:
         conn.execute(

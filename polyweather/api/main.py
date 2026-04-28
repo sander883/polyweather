@@ -195,13 +195,19 @@ def bankroll() -> dict:
 
 
 @app.get("/calibration")
-def calibration(n_bins: int = 10) -> list[dict]:
+def calibration(
+    n_bins: int = 10,
+    include_tails: bool = Query(
+        False, description="Include tail bets (entry price below min_p_market)",
+    ),
+) -> list[dict]:
+    floor = None if include_tails else get_settings().min_p_market
     return [
         {
             "lower": b.lower, "upper": b.upper, "n": b.n,
             "mean_pred": b.mean_pred, "fraction_positive": b.fraction_positive,
         }
-        for b in reliability_bins(n_bins=n_bins)
+        for b in reliability_bins(n_bins=n_bins, min_p_market=floor)
     ]
 
 

@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     overconfidence_threshold: float = 0.85
     overconfidence_kelly_multiplier: float = 0.5
 
+    # Realism penalties applied to paper PnL so the running total tracks
+    # something closer to live trading conditions:
+    #  - simulated_slippage_pct widens the effective entry price (we "pay"
+    #    more than the displayed yes_price; weather buckets routinely show
+    #    bid/ask spreads of 5-15%).
+    #  - simulated_fee_pct deducts taker fees from PnL at close time
+    #    (Polymarket weather markets currently quote 5% taker).
+    simulated_slippage_pct: float = 0.05
+    simulated_fee_pct: float = 0.05
+
     # Background scheduler — runs scan + settle automatically when uvicorn
     # is up. Set scheduler_enabled=false to disable (manual /scan + /settle
     # still work).

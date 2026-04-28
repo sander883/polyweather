@@ -90,7 +90,11 @@ def open_paper_position(
         log.info("skip signal %d: per-city/day cap reached", signal_id)
         return None
 
-    shares = size_usd / entry_price if entry_price > 0 else 0.0
+    # Apply slippage so paper PnL is closer to live: we always pay above the
+    # displayed yes_price when crossing the spread on a small order book.
+    # Capped at 0.999 to avoid division blow-ups on already-near-1 entries.
+    effective_entry = min(entry_price * (1 + s.simulated_slippage_pct), 0.999)
+    shares = size_usd / effective_entry if effective_entry > 0 else 0.0
     with get_conn() as conn:
         cur = conn.execute(
             """
@@ -99,13 +103,15 @@ def open_paper_position(
                  entry_price, size_usd, shares, p_model_at_entry, status)
             VALUES (?, ?, ?, 'YES', ?, ?, ?, ?, 'OPEN')
             """,
-            (market_id, bucket_id, signal_id, entry_price, size_usd, shares, p_model),
+            (market_id, bucket_id, signal_id, effective_entry, size_usd, shares, p_model),
         )
         position_id = int(cur.lastrowid)
         conn.execute("UPDATE signals SET acted = 1 WHERE id = ?", (signal_id,))
     log.info(
-        "paper open: pos=%d market=%d bucket=%d size=$%.2f @ %.3f",
-        position_id, market_id, bucket_id, size_usd, entry_price,
+        "paper open: pos=%d market=%d bucket=%d size=$%.2f @ %.4f"
+        " (display=%.3f, slip=%.1f%%)",
+        position_id, market_id, bucket_id, size_usd, effective_entry,
+        entry_price, s.simulated_slippage_pct * 100,
     )
     return position_id
 
