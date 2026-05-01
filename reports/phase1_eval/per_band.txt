@@ -1,6 +1,0 @@
-Price Band Performance
-======================================================================
-tail (<5¢)      | trades= 8 | wins= 5 | win_rate=62.5% | avg=$ 613.97 | total=$ 4911.74
-low (5-20¢)     | trades=10 | wins= 5 | win_rate=50.0% | avg=$  45.17 | total=$  451.71
-mid (20-50¢)    | trades=16 | wins= 6 | win_rate=37.5% | avg=$  -3.34 | total=$  -53.40
-high (>50¢)     | trades=26 | wins=17 | win_rate=65.4% | avg=$  -1.29 | total=$  -33.58

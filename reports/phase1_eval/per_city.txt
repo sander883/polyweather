@@ -1,7 +1,0 @@
-City Performance Summary
-======================================================================
-CHI    | trades=13 | wins= 9 | win_rate=69.2% | avg=$ 163.53 | total=$ 2125.91
-DEN    | trades=18 | wins=10 | win_rate=55.6% | avg=$  64.07 | total=$ 1153.30
-LAX    | trades= 8 | wins= 4 | win_rate=50.0% | avg=$ 181.97 | total=$ 1455.74
-MIA    | trades=10 | wins= 4 | win_rate=40.0% | avg=$   3.12 | total=$   31.21
-NYC    | trades=11 | wins= 6 | win_rate=54.5% | avg=$  46.39 | total=$  510.31
