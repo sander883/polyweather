@@ -27,7 +27,7 @@ class Settings(BaseSettings):
         validation_alias="POLYMARKET_CLOB_BASE",
     )
 
-    edge_threshold: float = 0.08
+    edge_threshold: float = 0.20
     min_liquidity: float = 2000.0
     paper_bankroll: float = 500.0
     kelly_fraction: float = 0.25
@@ -37,13 +37,23 @@ class Settings(BaseSettings):
 
     min_time_to_settle_hours: float = 1.0
     ensemble_members: int = 31
-    laplace_alpha: float = 0.5
+    laplace_alpha: float = 0.1
 
-    # Day-1 calibration learnings (see commit log):
-    # - tail buckets priced near zero are noise, not alpha → skip
-    # - very-high model confidence is suspicious until we have enough
-    #   calibration data, so halve the Kelly fraction in that regime.
-    min_p_market: float = 0.01
+    # Day-5 calibration learnings (n=56 settled positions):
+    # - 0.5 Laplace smoothing was inflating probabilities on unsampled tails,
+    #   creating fake edges → dropped to 0.1 so probability concentrates where
+    #   the ensemble actually points.
+    # - The 0.08 edge threshold let through noise; win rate by edge band was
+    #   essentially flat. Raised to 0.20 to require substantial disagreement.
+    # - Buckets priced 1¢-10¢ produced winners only by variance; the actual
+    #   alpha lived in the 30-70¢ price range where model+market roughly
+    #   agreed. Floor raised to 0.10.
+    # - Calibration showed model is severely overconfident in 0.30-0.50 and
+    #   0.80-0.90 p_model bands (gap of −28% and −60% respectively). Trade
+    #   only the regions where calibration is least broken.
+    min_p_market: float = 0.10
+    p_model_min: float = 0.30
+    p_model_max: float = 0.80
     overconfidence_threshold: float = 0.85
     overconfidence_kelly_multiplier: float = 0.5
 

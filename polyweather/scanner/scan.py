@@ -262,6 +262,11 @@ async def scan_once() -> dict:
                     # don't pay off enough to justify the position.
                     continue
                 p_model = probs.get(b.token_id, 0.0)
+                if p_model < s.p_model_min or p_model > s.p_model_max:
+                    # Day-5 calibration showed actual win rate diverges from
+                    # p_model by 25-60% in the 0.30-0.50 and 0.80-0.90 bands.
+                    # Trade only where the model is least broken.
+                    continue
                 edge = p_model - b.yes_price
                 if edge < s.edge_threshold:
                     continue
