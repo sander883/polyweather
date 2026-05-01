@@ -27,7 +27,11 @@ class Settings(BaseSettings):
         validation_alias="POLYMARKET_CLOB_BASE",
     )
 
-    edge_threshold: float = 0.20
+    # Phase 2A — switched threshold from `edge` (additive, p_model − price)
+    # to `EV` (multiplicative, p*(1/price-1) − (1-p)). EV scales correctly
+    # across price ranges; a 0.20 edge at $0.50 means much less than a 0.20
+    # edge at $0.05.
+    min_ev: float = 0.10
     min_liquidity: float = 2000.0
     paper_bankroll: float = 500.0
     kelly_fraction: float = 0.25
@@ -35,25 +39,28 @@ class Settings(BaseSettings):
     max_pct_per_market: float = 0.08
     max_pct_per_city_day: float = 0.15
 
-    min_time_to_settle_hours: float = 1.0
-    ensemble_members: int = 31
-    laplace_alpha: float = 0.1
+    min_time_to_settle_hours: float = 2.0
+    max_time_to_settle_hours: float = 72.0
 
-    # Day-5 calibration learnings (n=56 settled positions):
-    # - 0.5 Laplace smoothing was inflating probabilities on unsampled tails,
-    #   creating fake edges → dropped to 0.1 so probability concentrates where
-    #   the ensemble actually points.
-    # - The 0.08 edge threshold let through noise; win rate by edge band was
-    #   essentially flat. Raised to 0.20 to require substantial disagreement.
-    # - Buckets priced 1¢-10¢ produced winners only by variance; the actual
-    #   alpha lived in the 30-70¢ price range where model+market roughly
-    #   agreed. Floor raised to 0.10.
-    # - Calibration showed model is severely overconfident in 0.30-0.50 and
-    #   0.80-0.90 p_model bands (gap of −28% and −60% respectively). Trade
-    #   only the regions where calibration is least broken.
-    min_p_market: float = 0.10
+    # Phase 2A — alteregoeth/weatherbot sigma defaults: expected forecast
+    # error (in °F) for tail-bucket normal CDF. Self-calibration (Phase 2C)
+    # replaces these with empirical per-(city, source) MAE.
+    sigma_default_f: float = 2.0
+    sigma_default_c: float = 1.2
+
+    # Phase 2A — never buy a "favorite". Markets priced > max_price rarely
+    # have enough mispricing to clear EV after slippage + fees. Day-5
+    # diagnostics showed our normal-priced winners (entry > 50¢) were a
+    # rounding error vs the tail-bet variance.
+    max_price: float = 0.45
+    min_p_market: float = 0.05
+
+    # Lower bound on p_model: with a point forecast + binary bucket, p_model
+    # is either 1.0 (forecast in bucket) or 0.0 (out). For tail buckets it
+    # falls on the normal CDF. We never want to trade if the forecast says
+    # the bucket is highly unlikely.
     p_model_min: float = 0.30
-    p_model_max: float = 0.80
+
     overconfidence_threshold: float = 0.85
     overconfidence_kelly_multiplier: float = 0.5
 

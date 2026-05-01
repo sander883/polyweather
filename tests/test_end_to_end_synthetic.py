@@ -1,4 +1,4 @@
-"""Synthetic end-to-end: Event-shaped payload → forecasts → signal → paper position."""
+"""Synthetic end-to-end: Event-shaped payload → forecast → signal → paper position."""
 
 from __future__ import annotations
 
@@ -27,13 +27,13 @@ def isolated_db(monkeypatch):
 def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
     from polyweather.scanner.models import Event
     from polyweather.scanner.parser import parse_event
-    from polyweather.fetchers.gfs_ensemble import EnsembleForecast, persist_forecast
+    from polyweather.fetchers.forecast import PointForecast, persist_point_forecast
     from polyweather.scanner.scan import (
         _upsert_event,
         _find_forecast_id,
         _insert_signal,
     )
-    from polyweather.model.probability import Bucket, bucket_probabilities
+    from polyweather.model.probability import Bucket, bucket_prob, expected_value
     from polyweather.sizing.kelly import recommended_size
     from polyweather.trading.paper import execute_pending_signals, list_positions
     from polyweather.db.connection import get_conn
@@ -58,7 +58,7 @@ def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
             "groupItemTitle": label,
         }
 
-    # Five-bucket event; market mispriced at 70-74 (market=0.20, model should be ~0.87)
+    # Five-bucket event; market mispriced at 70-74 (market=0.20, forecast=72°F → p=1.0)
     event_dict = {
         "id": "evt_synth",
         "slug": "nyc-temp-synth",
@@ -77,40 +77,31 @@ def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
     pe = parse_event(event)
     assert pe is not None and pe.city_code == "NYC"
     assert len(pe.buckets) == 5
-
-    # Synthetic ensemble concentrated in 70-74; min kept low to validate
-    # that the scanner picks the right array based on market_type.
-    members_max = [68.0] + [71.0] * 8 + [72.0] * 10 + [73.0] * 8 + [76.0] * 4
-    members_min = [52.0] * 31
-    fc = EnsembleForecast(
-        city_code="NYC",
-        source="gfs_ensemble",
-        run_time_utc=datetime.now(timezone.utc),
-        target_date=settle.date(),
-        target_time_utc=settle.replace(hour=23, minute=59, second=59),
-        daily_max_f_per_member=members_max,
-        daily_min_f_per_member=members_min,
-    )
-    # Event must be "high" type for this test's expectations
     assert pe.market_type == "high"
-    members = fc.samples_for(pe.market_type)
-    assert persist_forecast(fc) > 0
+
+    # Point forecast says 72°F (squarely inside the 70-74 closed bucket).
+    fc = PointForecast(
+        city_code="NYC",
+        target_date=settle.date(),
+        fetched_at=datetime.now(timezone.utc),
+        ecmwf_max=72.0, ecmwf_min=58.0,
+        hrrr_max=72.0, hrrr_min=58.0,
+    )
+    assert persist_point_forecast(fc) > 0
 
     market_id, tok_to_bucket = _upsert_event(pe)
     assert market_id > 0
     fid = _find_forecast_id("NYC", settle.date().isoformat())
     assert fid
 
-    prob_buckets = [Bucket(b.token_id, b.low, b.high) for b in pe.buckets]
-    probs = bucket_probabilities(members, prob_buckets)
-
-    # Find the 70-74 bucket's token id
     target_bucket = next(b for b in pe.buckets if b.outcome_label == "70-74")
-    p_model = probs[target_bucket.token_id]
+    bucket = Bucket(target_bucket.token_id, target_bucket.low, target_bucket.high)
+    p_model = bucket_prob(72.0, bucket, sigma=2.0)
+    assert p_model == 1.0   # closed bucket containing the forecast point
     p_market = target_bucket.yes_price
-    assert p_model > 0.70
-    edge = p_model - p_market
-    assert edge > get_settings().edge_threshold
+
+    ev = expected_value(p_model, p_market)
+    assert ev >= get_settings().min_ev
 
     sz = recommended_size(
         p_model=p_model, price=p_market, bankroll=get_settings().paper_bankroll
@@ -123,8 +114,8 @@ def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
         forecast_id=fid,
         p_model=p_model,
         p_market=p_market,
-        edge=edge,
-        ev=p_model / p_market - 1,
+        edge=p_model - p_market,
+        ev=ev,
         size_usd=sz.size_usd,
         kelly_used=sz.kelly_used,
         reason="synthetic",

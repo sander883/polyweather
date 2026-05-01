@@ -1,15 +1,22 @@
-"""Convert an ensemble sample into per-bucket probabilities.
+"""Bucket probabilities from a point forecast.
 
-A ``Bucket`` is a half-open interval ``[low, high)`` in °F. Either bound may be
-``None`` for open-ended buckets (e.g. ``"< 50°F"`` or ``">= 90°F"``).
+Switched from Laplace-smoothed ensemble (Day-1) to alteregoeth/weatherbot's
+proven approach (Day-5 calibration showed Laplace was fabricating phantom
+edges in tail buckets):
+
+  - For closed buckets [low, high): probability is 1.0 if the forecast point
+    falls inside, 0.0 otherwise.
+  - For open-ended (tail) buckets — "<X°F" or ">=X°F" — use a normal CDF
+    around the forecast point with sigma = expected forecast error.
+
+Sigma defaults are conservative (2°F US / 1.2°C). Self-calibration (Phase 2C)
+will replace these with empirically-learned per-(city, source) MAEs.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Iterable
-
-from polyweather.config import get_settings
 
 
 @dataclass(frozen=True)
@@ -26,44 +33,66 @@ class Bucket:
         return True
 
 
-def _count_in_bucket(samples: Iterable[float], bucket: Bucket) -> int:
-    return sum(1 for s in samples if bucket.contains(s))
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bucket_prob(forecast: float, bucket: Bucket, *, sigma: float) -> float:
+    """Probability the actual outcome lands in *bucket*, given a point forecast.
+
+    Closed bucket [low, high) → 1.0 if forecast inside, else 0.0.
+    Open-ended bucket (low or high is None) → normal CDF using sigma.
+    """
+    if sigma <= 0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
+
+    # Open-ended on the bottom: bucket is "< high"
+    if bucket.low is None and bucket.high is not None:
+        return _norm_cdf((bucket.high - forecast) / sigma)
+
+    # Open-ended on the top: bucket is ">= low"
+    if bucket.high is None and bucket.low is not None:
+        return 1.0 - _norm_cdf((bucket.low - forecast) / sigma)
+
+    # Fully open (rare): degenerate, always 1.0
+    if bucket.low is None and bucket.high is None:
+        return 1.0
+
+    # Closed bucket: deterministic match on the forecast point.
+    return 1.0 if bucket.contains(forecast) else 0.0
 
 
 def bucket_probabilities(
-    samples: list[float],
+    forecast: float,
     buckets: list[Bucket],
     *,
-    alpha: float | None = None,
+    sigma: float,
 ) -> dict[str, float]:
-    """Return label → probability, Laplace-smoothed, summing to 1.0.
+    """Per-bucket probabilities for a single point forecast.
 
-    Smoothing prevents P=0 on unsampled tails — important when 0/31 members
-    doesn't mean "impossible", just "not yet sampled".
+    Closed buckets get 1.0/0.0; tail buckets use sigma. The result is NOT
+    forced to sum to 1.0 because tail buckets at both ends of a finite-bucket
+    market are a small leakage we tolerate (the EV calculation is per-bucket
+    anyway).
     """
-    if not samples:
-        raise ValueError("samples must be non-empty")
-    if not buckets:
-        raise ValueError("buckets must be non-empty")
+    return {b.label: bucket_prob(forecast, b, sigma=sigma) for b in buckets}
 
-    a = get_settings().laplace_alpha if alpha is None else alpha
-    n = len(samples)
-    k = len(buckets)
 
-    denom = n + a * k
-    probs: dict[str, float] = {}
-    for b in buckets:
-        c = _count_in_bucket(samples, b)
-        probs[b.label] = (c + a) / denom
+def expected_value(p: float, price: float) -> float:
+    """Expected return per $1 staked. Matches alteregoeth's calc_ev:
 
-    # Numerical safety: renormalize (accounts for samples outside all buckets)
-    total = sum(probs.values())
-    if total > 0:
-        probs = {k: v / total for k, v in probs.items()}
-    return probs
+        EV = p * (1/price - 1) - (1 - p)
+
+    Positive EV ⇔ p > price. Use this as the trade filter (e.g. EV >= 0.10
+    means a 10% expected return per $ at the quoted price).
+    """
+    if price <= 0 or price >= 1:
+        return 0.0
+    return p * (1.0 / price - 1.0) - (1.0 - p)
 
 
 def summary_stats(samples: list[float]) -> dict[str, float]:
+    """Summary stats for raw ensemble samples (still used by /forecast endpoint)."""
     import numpy as np
     arr = np.asarray(samples, dtype=float)
     return {

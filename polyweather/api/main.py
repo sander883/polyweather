@@ -15,14 +15,13 @@ from polyweather.cities import CITIES
 from polyweather.config import get_settings
 from polyweather.db.connection import get_conn
 from polyweather.db.init import init_db
-from polyweather.fetchers.gfs_ensemble import (
-    fetch_gfs_ensemble,
-    load_members,
-    persist_forecast,
+from polyweather.fetchers.forecast import (
+    fetch_point_forecast,
+    load_point_forecast,
+    persist_point_forecast,
 )
 from polyweather.logging_setup import setup_logging
 from polyweather.model.calibration import reliability_bins
-from polyweather.model.probability import summary_stats
 from polyweather.scanner.scan import scan_once
 from polyweather.scheduler import (
     scheduler_status,
@@ -58,7 +57,8 @@ def health() -> dict:
         "version": __version__,
         "cities": sorted(CITIES),
         "settings": {
-            "edge_threshold": get_settings().edge_threshold,
+            "min_ev": get_settings().min_ev,
+            "max_price": get_settings().max_price,
             "min_liquidity": get_settings().min_liquidity,
             "paper_bankroll": get_settings().paper_bankroll,
             "kelly_fraction": get_settings().kelly_fraction,
@@ -93,20 +93,14 @@ async def forecast(
     )
 
     if fresh:
-        fc = await fetch_gfs_ensemble(code, target_date)
-        persist_forecast(fc)
+        fc = await fetch_point_forecast(code, target_date)
+        persist_point_forecast(fc)
         return {
             "city": code,
             "target_date": target_date.isoformat(),
-            "source": "gfs_ensemble",
-            "max": {
-                "members": fc.daily_max_f_per_member,
-                "stats": summary_stats(fc.daily_max_f_per_member),
-            },
-            "min": {
-                "members": fc.daily_min_f_per_member,
-                "stats": summary_stats(fc.daily_min_f_per_member),
-            },
+            "source": "multi_source",
+            "ecmwf": {"max": fc.ecmwf_max, "min": fc.ecmwf_min},
+            "hrrr": {"max": fc.hrrr_max, "min": fc.hrrr_min},
         }
 
     with get_conn() as conn:
@@ -115,7 +109,8 @@ async def forecast(
             SELECT id, run_time_utc, target_time_utc, members_json,
                    mean_value, std_value, fetched_at
               FROM forecasts
-             WHERE city_code = ? AND source = 'gfs_ensemble'
+             WHERE city_code = ?
+               AND source IN ('multi_source', 'gfs_ensemble')
                AND substr(target_time_utc, 1, 10) = ?
           ORDER BY fetched_at DESC LIMIT 1
             """,
@@ -126,21 +121,13 @@ async def forecast(
             404,
             f"No cached forecast for {code} on {target_date}. Retry with fresh=true.",
         )
-    maxes = load_members(row["members_json"], "max")
-    result = {
+    return {
         "city": code,
         "target_date": target_date.isoformat(),
-        "source": "gfs_ensemble",
+        "source": "multi_source",
         "fetched_at": row["fetched_at"],
-        "max": {"members": maxes, "stats": summary_stats(maxes)},
+        "data": load_point_forecast(row["members_json"]),
     }
-    try:
-        mins = load_members(row["members_json"], "min")
-        result["min"] = {"members": mins, "stats": summary_stats(mins)}
-    except ValueError:
-        # Legacy row: max-only, omit min block
-        pass
-    return result
 
 
 @app.get("/markets")

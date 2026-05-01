@@ -17,9 +17,16 @@ def test_kelly_capped_to_zero_on_negative_edge():
 
 def test_kelly_edge_cases():
     assert kelly_fraction(0.0, 0.5) == 0.0
-    assert kelly_fraction(1.0, 0.5) == 0.0
     assert kelly_fraction(0.5, 0.0) == 0.0
     assert kelly_fraction(0.5, 1.0) == 0.0
+
+
+def test_kelly_p_one_is_full_bet():
+    # Phase 2A — closed-bucket point forecast gives p=1.0 exactly. The full
+    # Kelly fraction is 1.0 (bet everything); per-trade caps then bound the
+    # actual size.
+    assert kelly_fraction(1.0, 0.30) == 1.0
+    assert kelly_fraction(1.0, 0.99) == 1.0
 
 
 def test_recommended_size_respects_trade_cap():

@@ -15,8 +15,12 @@ def kelly_fraction(p_model: float, price: float) -> float:
     """
     if price <= 0 or price >= 1:
         return 0.0
-    if p_model <= 0 or p_model >= 1:
+    if p_model <= 0:
         return 0.0
+    # p_model == 1.0 is valid (closed-bucket forecast hit) — full Kelly is 1.0
+    # and the per-trade/market/city caps will bound the actual size.
+    if p_model >= 1.0:
+        return 1.0
     b = (1.0 - price) / price
     q = 1.0 - p_model
     f_star = (p_model * b - q) / b

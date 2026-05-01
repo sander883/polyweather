@@ -39,9 +39,33 @@ log = logging.getLogger(__name__)
 MarketType = Literal["high", "low", "precip", "other"]
 
 _CITY_ALIASES: dict[str, str] = {
-    "nyc": "NYC", "new york": "NYC", "new york city": "NYC", "jfk": "NYC",
-    "los angeles": "LAX", "la": "LAX", "lax": "LAX",
-    "chicago": "ORD", "ord": "ORD", "midway": "ORD",
+    # US
+    "nyc": "NYC", "new york": "NYC", "new york city": "NYC",
+    "laguardia": "NYC", "klga": "NYC",
+    "los angeles": "LAX", "la": "LAX", "lax": "LAX", "klax": "LAX",
+    "chicago": "ORD", "ord": "ORD", "o'hare": "ORD", "ohare": "ORD",
+    "midway": "ORD", "kord": "ORD",
+    "miami": "MIA", "kmia": "MIA",
+    "dallas": "DAL", "dal": "DAL", "love field": "DAL", "kdal": "DAL",
+    "seattle": "SEA", "sea-tac": "SEA", "seatac": "SEA", "ksea": "SEA",
+    "atlanta": "ATL", "atl": "ATL", "hartsfield": "ATL", "katl": "ATL",
+    # Europe
+    "london": "LON", "lon": "LON",
+    "paris": "PAR", "par": "PAR",
+    "munich": "MUC", "munchen": "MUC", "münchen": "MUC", "muc": "MUC",
+    "ankara": "ANK", "ank": "ANK",
+    # Asia
+    "seoul": "SEL", "sel": "SEL", "incheon": "SEL",
+    "tokyo": "TYO", "tyo": "TYO", "haneda": "TYO",
+    "shanghai": "SHA", "sha": "SHA",
+    "singapore": "SIN", "sin": "SIN",
+    "lucknow": "LKO", "lko": "LKO",
+    "tel aviv": "TLV", "tel-aviv": "TLV", "tlv": "TLV",
+    # Other
+    "toronto": "YYZ", "yyz": "YYZ",
+    "sao paulo": "GRU", "são paulo": "GRU", "sao-paulo": "GRU", "gru": "GRU",
+    "buenos aires": "EZE", "buenos-aires": "EZE", "eze": "EZE",
+    "wellington": "WLG", "wlg": "WLG",
 }
 
 # groupItemTitle patterns, °F assumed unless specified

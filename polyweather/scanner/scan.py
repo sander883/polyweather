@@ -7,16 +7,15 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from polyweather.cities import CITIES
+from polyweather.cities import CITIES, get_city
 from polyweather.config import get_settings
 from polyweather.db.connection import get_conn
-from polyweather.fetchers.gfs_ensemble import (
-    EnsembleForecast,
-    fetch_gfs_ensemble,
-    load_members,
-    persist_forecast,
+from polyweather.fetchers.forecast import (
+    PointForecast,
+    fetch_point_forecast,
+    persist_point_forecast,
 )
-from polyweather.model.probability import Bucket, bucket_probabilities
+from polyweather.model.probability import Bucket, bucket_prob, expected_value
 from polyweather.scanner.parser import ParsedEvent, group_flat_markets, parse_event
 from polyweather.scanner.polymarket_client import GammaClient
 from polyweather.sizing.kelly import recommended_size
@@ -75,21 +74,21 @@ async def _collect_events(client: GammaClient) -> list[ParsedEvent]:
 
 async def _forecasts_for_events(
     events: list[ParsedEvent],
-) -> dict[tuple[str, str], EnsembleForecast]:
+) -> dict[tuple[str, str], PointForecast]:
     targets: set[tuple[str, str]] = set()
     for e in events:
         if e.settle_time_utc is None:
             continue
         targets.add((e.city_code, e.settle_time_utc.date().isoformat()))
 
-    out: dict[tuple[str, str], EnsembleForecast] = {}
+    out: dict[tuple[str, str], PointForecast] = {}
 
     async def _one(city_code: str, date_iso: str) -> None:
         try:
             target = datetime.fromisoformat(date_iso).date()
-            fc = await fetch_gfs_ensemble(city_code, target)
+            fc = await fetch_point_forecast(city_code, target)
             out[(city_code, date_iso)] = fc
-            persist_forecast(fc)
+            persist_point_forecast(fc)
         except Exception as e:  # noqa: BLE001
             log.warning("forecast fetch failed city=%s date=%s: %s", city_code, date_iso, e)
 
@@ -171,7 +170,7 @@ def _find_forecast_id(city_code: str, target_date_iso: str) -> int | None:
             """
             SELECT id FROM forecasts
              WHERE city_code = ?
-               AND source = 'gfs_ensemble'
+               AND source IN ('multi_source', 'gfs_ensemble')
                AND substr(target_time_utc, 1, 10) = ?
           ORDER BY fetched_at DESC LIMIT 1
             """,
@@ -241,14 +240,20 @@ async def scan_once() -> dict:
             hours_to_settle = (pe.settle_time_utc - now_utc).total_seconds() / 3600.0
             if hours_to_settle < s.min_time_to_settle_hours:
                 continue
+            if hours_to_settle > s.max_time_to_settle_hours:
+                continue
             if pe.liquidity_usd < s.min_liquidity:
                 continue
 
-            prob_buckets = [
-                Bucket(label=b.token_id, low=b.low, high=b.high) for b in pe.buckets
-            ]
-            samples = fc.samples_for(pe.market_type)
-            probs = bucket_probabilities(samples, prob_buckets)
+            best = fc.best(pe.market_type, hours_to_settle)
+            if best is None:
+                log.debug("no usable forecast for %s %s", pe.city_code, target_iso)
+                continue
+            forecast_temp, source = best
+
+            # Sigma defaults (Phase 2A); per-(city, source) calibration is Phase 2C.
+            city = get_city(pe.city_code)
+            sigma = s.sigma_default_f if city.region == "us" else s.sigma_default_c * 9 / 5
 
             market_id, bucket_id_map = _upsert_event(pe)
             forecast_id = _find_forecast_id(pe.city_code, target_iso)
@@ -257,21 +262,19 @@ async def scan_once() -> dict:
                 if b.yes_price is None or b.yes_price <= 0 or b.yes_price >= 1:
                     continue
                 if b.yes_price < s.min_p_market:
-                    # Buckets priced near zero produce huge nominal EV that's
-                    # mostly noise — Day-1 calibration showed these tails
-                    # don't pay off enough to justify the position.
                     continue
-                p_model = probs.get(b.token_id, 0.0)
-                if p_model < s.p_model_min or p_model > s.p_model_max:
-                    # Day-5 calibration showed actual win rate diverges from
-                    # p_model by 25-60% in the 0.30-0.50 and 0.80-0.90 bands.
-                    # Trade only where the model is least broken.
+                if b.yes_price > s.max_price:
+                    # alteregoeth heuristic: never buy favorites. Day-5 data
+                    # showed entry > 50¢ trades net out near zero after fees.
                     continue
-                edge = p_model - b.yes_price
-                if edge < s.edge_threshold:
+
+                bucket = Bucket(label=b.token_id, low=b.low, high=b.high)
+                p_model = bucket_prob(forecast_temp, bucket, sigma=sigma)
+                if p_model < s.p_model_min:
                     continue
-                ev = (p_model / b.yes_price) - 1.0
-                if ev <= 0:
+
+                ev = expected_value(p_model, b.yes_price)
+                if ev < s.min_ev:
                     continue
 
                 sz = recommended_size(
@@ -282,9 +285,10 @@ async def scan_once() -> dict:
                 if sz.size_usd <= 0:
                     continue
 
+                edge = p_model - b.yes_price  # informational only, kept for DB compat
                 reason = (
-                    f"edge={edge:.3f} ev={ev:.3f} "
-                    f"p_model={p_model:.3f} p_market={b.yes_price:.3f} "
+                    f"ev={ev:.3f} p_model={p_model:.3f} p_market={b.yes_price:.3f} "
+                    f"forecast={forecast_temp:.1f}°F src={source} sigma={sigma:.2f} "
                     f"kelly_full={sz.kelly_full:.3f} cap={sz.cap_hit}"
                 )
                 _insert_signal(
