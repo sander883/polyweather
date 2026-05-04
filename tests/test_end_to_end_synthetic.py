@@ -97,7 +97,8 @@ def test_event_pipeline_emits_signal_and_opens_paper_position(isolated_db):
     target_bucket = next(b for b in pe.buckets if b.outcome_label == "70-74")
     bucket = Bucket(target_bucket.token_id, target_bucket.low, target_bucket.high)
     p_model = bucket_prob(72.0, bucket, sigma=2.0)
-    assert p_model == 1.0   # closed bucket containing the forecast point
+    # Forecast 72°F centred in [70, 74) with σ=2°F → ≈ 68% (±1σ inside).
+    assert 0.65 < p_model < 0.71
     p_market = target_bucket.yes_price
 
     ev = expected_value(p_model, p_market)

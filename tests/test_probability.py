@@ -26,15 +26,36 @@ def test_bucket_open_ended():
     assert not lo.contains(50.0)
 
 
-def test_closed_bucket_is_binary_on_forecast():
-    """Closed buckets get 1.0 if the forecast lands inside, 0.0 otherwise."""
+def test_closed_bucket_uses_normal_cdf():
+    """Closed buckets integrate the normal CDF — never 1.0, even when centred."""
     b = Bucket("70-74", 70.0, 74.0)
-    assert bucket_prob(72.0, b, sigma=2.0) == 1.0
-    assert bucket_prob(70.0, b, sigma=2.0) == 1.0
-    assert bucket_prob(73.99, b, sigma=2.0) == 1.0
-    assert bucket_prob(74.0, b, sigma=2.0) == 0.0
-    assert bucket_prob(69.99, b, sigma=2.0) == 0.0
-    assert bucket_prob(60.0, b, sigma=2.0) == 0.0
+
+    # Forecast centred in 4°F-wide bucket with sigma=2°F → ±1σ inside
+    # → P(within ±1σ of mean) ≈ 0.68
+    p_centre = bucket_prob(72.0, b, sigma=2.0)
+    assert 0.65 < p_centre < 0.71
+
+    # Forecast far outside bucket → near zero (not exactly 0)
+    p_far = bucket_prob(60.0, b, sigma=2.0)
+    assert p_far < 0.001
+
+    # Forecast at lower edge → only the upper half of the bucket counts
+    # → ≈ Φ(2) − Φ(0) = 0.477
+    p_edge = bucket_prob(70.0, b, sigma=2.0)
+    assert 0.45 < p_edge < 0.50
+
+    # Smaller sigma concentrates the mass — at sigma=0.5, p_centre approaches 1
+    p_tight = bucket_prob(72.0, b, sigma=0.5)
+    assert p_tight > 0.99
+
+
+def test_closed_bucket_probabilities_decline_with_distance():
+    """Probability for the same bucket should fall as forecast moves away."""
+    b = Bucket("70-74", 70.0, 74.0)
+    p_in = bucket_prob(72.0, b, sigma=2.0)
+    p_edge = bucket_prob(74.0, b, sigma=2.0)   # exactly on upper boundary
+    p_out = bucket_prob(76.0, b, sigma=2.0)
+    assert p_in > p_edge > p_out
 
 
 def test_open_top_bucket_uses_normal_cdf():
@@ -60,8 +81,8 @@ def test_open_bottom_bucket_uses_normal_cdf():
     assert p < 0.03          # two sigma above boundary
 
 
-def test_bucket_probabilities_dispatches_correctly():
-    """A market with mixed closed + tail buckets returns the right probs."""
+def test_bucket_probabilities_sum_to_about_one():
+    """A complete bucket partition should integrate to ≈1.0 across all buckets."""
     buckets = [
         Bucket("<60", None, 60.0),
         Bucket("60-69", 60.0, 70.0),
@@ -69,10 +90,17 @@ def test_bucket_probabilities_dispatches_correctly():
         Bucket(">=80", 80.0, None),
     ]
     probs = bucket_probabilities(72.0, buckets, sigma=2.0)
-    assert probs["<60"] < 0.001    # 6 sigma below 60
-    assert probs["60-69"] == 0.0
-    assert probs["70-79"] == 1.0   # closed bucket containing 72°F
-    assert probs[">=80"] < 0.001   # 4 sigma below 80
+    total = sum(probs.values())
+    assert abs(total - 1.0) < 0.01
+
+    # The bucket containing the forecast should dominate.
+    # Forecast 72 in [70, 80) with σ=2 → P ≈ Φ(4) − Φ(−1) ≈ 0.84.
+    assert probs["70-79"] > 0.80
+    # Sibling bucket below picks up the lower-tail mass (Φ(−1) ≈ 0.16).
+    assert 0.10 < probs["60-69"] < 0.20
+    # Far-tail buckets should be tiny
+    assert probs["<60"] < 0.001
+    assert probs[">=80"] < 0.001
 
 
 def test_expected_value_positive_when_prob_gt_price():

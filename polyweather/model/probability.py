@@ -1,16 +1,20 @@
 """Bucket probabilities from a point forecast.
 
-Switched from Laplace-smoothed ensemble (Day-1) to alteregoeth/weatherbot's
-proven approach (Day-5 calibration showed Laplace was fabricating phantom
-edges in tail buckets):
+Phase 2A.1 fix (Day-8 review): the alteregoeth/weatherbot pattern of binary
+1.0/0.0 for closed buckets was producing 20% win rate in our paper run because
+forecasts have ±2-5°F MAE — saying "p=1.0" on a bucket the forecast lands in
+ignores that the true outcome could easily fall in a neighbouring bucket.
 
-  - For closed buckets [low, high): probability is 1.0 if the forecast point
-    falls inside, 0.0 otherwise.
-  - For open-ended (tail) buckets — "<X°F" or ">=X°F" — use a normal CDF
-    around the forecast point with sigma = expected forecast error.
+We now treat the forecast as the mean of a normal distribution with std=sigma
+and integrate the normal CDF over EVERY bucket, including closed ones:
 
-Sigma defaults are conservative (2°F US / 1.2°C). Self-calibration (Phase 2C)
-will replace these with empirically-learned per-(city, source) MAEs.
+    P(X in [low, high)) = Φ((high - forecast) / σ) − Φ((low - forecast) / σ)
+    P(X < high)         = Φ((high - forecast) / σ)         (open bottom)
+    P(X >= low)         = 1 − Φ((low - forecast) / σ)      (open top)
+
+This produces honest probabilities (typically 0.4-0.8 for the bucket the
+forecast hits, vs the previous 1.0) so EV and Kelly downstream reflect actual
+uncertainty.
 """
 
 from __future__ import annotations
@@ -40,8 +44,8 @@ def _norm_cdf(x: float) -> float:
 def bucket_prob(forecast: float, bucket: Bucket, *, sigma: float) -> float:
     """Probability the actual outcome lands in *bucket*, given a point forecast.
 
-    Closed bucket [low, high) → 1.0 if forecast inside, else 0.0.
-    Open-ended bucket (low or high is None) → normal CDF using sigma.
+    Treats `forecast` as N(forecast, sigma²) and integrates the normal CDF
+    over the bucket's interval. Open-ended sides use one-sided CDF.
     """
     if sigma <= 0:
         raise ValueError(f"sigma must be positive, got {sigma}")
@@ -58,8 +62,10 @@ def bucket_prob(forecast: float, bucket: Bucket, *, sigma: float) -> float:
     if bucket.low is None and bucket.high is None:
         return 1.0
 
-    # Closed bucket: deterministic match on the forecast point.
-    return 1.0 if bucket.contains(forecast) else 0.0
+    # Closed bucket [low, high): difference of two CDFs.
+    upper = _norm_cdf((bucket.high - forecast) / sigma)
+    lower = _norm_cdf((bucket.low - forecast) / sigma)
+    return max(0.0, upper - lower)
 
 
 def bucket_probabilities(
@@ -70,10 +76,9 @@ def bucket_probabilities(
 ) -> dict[str, float]:
     """Per-bucket probabilities for a single point forecast.
 
-    Closed buckets get 1.0/0.0; tail buckets use sigma. The result is NOT
-    forced to sum to 1.0 because tail buckets at both ends of a finite-bucket
-    market are a small leakage we tolerate (the EV calculation is per-bucket
-    anyway).
+    All buckets are scored via normal CDF. With well-defined buckets (no gaps
+    or overlaps) the values approximately sum to 1.0; we don't force-normalise
+    because the EV calculation is per-bucket anyway.
     """
     return {b.label: bucket_prob(forecast, b, sigma=sigma) for b in buckets}
 
