@@ -270,8 +270,6 @@ async def scan_once() -> dict:
 
                 bucket = Bucket(label=b.token_id, low=b.low, high=b.high)
                 p_model = bucket_prob(forecast_temp, bucket, sigma=sigma)
-                if p_model < s.p_model_min:
-                    continue
 
                 ev = expected_value(p_model, b.yes_price)
                 if ev < s.min_ev:

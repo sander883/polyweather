@@ -55,11 +55,12 @@ class Settings(BaseSettings):
     max_price: float = 0.45
     min_p_market: float = 0.05
 
-    # Lower bound on p_model: with a point forecast + binary bucket, p_model
-    # is either 1.0 (forecast in bucket) or 0.0 (out). For tail buckets it
-    # falls on the normal CDF. We never want to trade if the forecast says
-    # the bucket is highly unlikely.
-    p_model_min: float = 0.30
+    # Phase 2A.1 (Day-8 review): probabilistic CDF scoring makes p_model
+    # honest (typically 0.5-0.7 for hit bucket, 0.1-0.2 for neighbours).
+    # Combined with p_model_min=0.30 + max_price=0.45 this caused 0 signals
+    # — neighbours blocked by p_model_min, centres blocked by max_price.
+    # Removed p_model_min entirely; the EV filter alone enforces quality
+    # (a 16% probability at price 18¢ already fails min_ev=0.10).
 
     overconfidence_threshold: float = 0.85
     overconfidence_kelly_multiplier: float = 0.5
