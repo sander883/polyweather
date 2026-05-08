@@ -27,11 +27,17 @@ class Settings(BaseSettings):
         validation_alias="POLYMARKET_CLOB_BASE",
     )
 
-    # Phase 2A — switched threshold from `edge` (additive, p_model − price)
-    # to `EV` (multiplicative, p*(1/price-1) − (1-p)). EV scales correctly
-    # across price ranges; a 0.20 edge at $0.50 means much less than a 0.20
-    # edge at $0.05.
-    min_ev: float = 0.10
+    # Phase 2A.3 — Day-9 review (0/23 wins on Phase 2A.2):
+    #   - probabilistic neighbour-bucket trading produced systematic losses
+    #     because real forecast MAE (3-5°F at D+1 to D+3) is much wider
+    #     than the σ=2°F default; we overestimated p on neighbours by ~2x.
+    #   - many Polymarket weather markets use 1°F-wide buckets, smaller
+    #     than the typical forecast error → bucket mis-assignment is the
+    #     dominant failure mode.
+    # Fix: only trade the bucket the forecast actually hits, skip narrow
+    # buckets, raise sigma to a more honest value, raise min_ev so any
+    # single trade has substantial buffer to survive bucket mis-assignment.
+    min_ev: float = 0.30
     min_liquidity: float = 2000.0
     paper_bankroll: float = 500.0
     kelly_fraction: float = 0.25
@@ -42,25 +48,22 @@ class Settings(BaseSettings):
     min_time_to_settle_hours: float = 2.0
     max_time_to_settle_hours: float = 72.0
 
-    # Phase 2A — alteregoeth/weatherbot sigma defaults: expected forecast
-    # error (in °F) for tail-bucket normal CDF. Self-calibration (Phase 2C)
-    # replaces these with empirical per-(city, source) MAE.
-    sigma_default_f: float = 2.0
-    sigma_default_c: float = 1.2
+    # Forecast-error std defaults (°F / °C) for the normal-CDF bucket model.
+    # Bumped from 2.0/1.2 → 4.0/2.4 to match observed ECMWF/HRRR MAE at
+    # 24-72h horizons. Self-calibration (Phase 2C) replaces these with
+    # empirical per-(city, source) MAE.
+    sigma_default_f: float = 4.0
+    sigma_default_c: float = 2.4
 
-    # Phase 2A — never buy a "favorite". Markets priced > max_price rarely
-    # have enough mispricing to clear EV after slippage + fees. Day-5
-    # diagnostics showed our normal-priced winners (entry > 50¢) were a
-    # rounding error vs the tail-bet variance.
+    # Skip buckets narrower than this (in °F) — forecast error makes them
+    # un-tradeable. 1°F buckets near the resolution day are common but
+    # smaller than HRRR/ECMWF MAE so we bucket-miss most of the time.
+    min_bucket_width_f: float = 2.0
+
+    # Never buy a "favorite". Markets priced > max_price rarely have enough
+    # mispricing to clear EV after slippage + fees.
     max_price: float = 0.45
     min_p_market: float = 0.05
-
-    # Phase 2A.1 (Day-8 review): probabilistic CDF scoring makes p_model
-    # honest (typically 0.5-0.7 for hit bucket, 0.1-0.2 for neighbours).
-    # Combined with p_model_min=0.30 + max_price=0.45 this caused 0 signals
-    # — neighbours blocked by p_model_min, centres blocked by max_price.
-    # Removed p_model_min entirely; the EV filter alone enforces quality
-    # (a 16% probability at price 18¢ already fails min_ev=0.10).
 
     overconfidence_threshold: float = 0.85
     overconfidence_kelly_multiplier: float = 0.5

@@ -258,54 +258,99 @@ async def scan_once() -> dict:
             market_id, bucket_id_map = _upsert_event(pe)
             forecast_id = _find_forecast_id(pe.city_code, target_iso)
 
-            for b in pe.buckets:
-                if b.yes_price is None or b.yes_price <= 0 or b.yes_price >= 1:
-                    continue
-                if b.yes_price < s.min_p_market:
-                    continue
-                if b.yes_price > s.max_price:
-                    # alteregoeth heuristic: never buy favorites. Day-5 data
-                    # showed entry > 50¢ trades net out near zero after fees.
-                    continue
-
-                bucket = Bucket(label=b.token_id, low=b.low, high=b.high)
-                p_model = bucket_prob(forecast_temp, bucket, sigma=sigma)
-
-                ev = expected_value(p_model, b.yes_price)
-                if ev < s.min_ev:
-                    continue
-
-                sz = recommended_size(
-                    p_model=p_model,
-                    price=b.yes_price,
-                    bankroll=s.paper_bankroll,
+            # Phase 2A.3 — alteregoeth-style discipline: only consider the
+            # bucket the forecast actually lands in. Day-8 data showed that
+            # scoring every bucket via probabilistic CDF produced 0/23 wins
+            # because neighbour buckets at p≈0.14 + price 5-15¢ looked like
+            # +EV trades on paper but the model overestimates them by ~2x in
+            # practice. Restricting to the hit bucket aligns with the proven
+            # baseline and keeps probabilistic CDF only for sizing nuance.
+            hit_bucket = next(
+                (b for b in pe.buckets
+                 if b.low is not None and b.high is not None
+                 and b.low <= forecast_temp < b.high),
+                None,
+            )
+            # Tail-bucket fallback: forecast is past the highest closed bucket
+            # → use the open-ended ">=X" bucket, or vice-versa.
+            if hit_bucket is None:
+                hit_bucket = next(
+                    (b for b in pe.buckets
+                     if (b.low is None and b.high is not None
+                         and forecast_temp < b.high)
+                     or (b.high is None and b.low is not None
+                         and forecast_temp >= b.low)),
+                    None,
                 )
-                if sz.size_usd <= 0:
-                    continue
+            if hit_bucket is None:
+                log.debug(
+                    "no bucket contains forecast %.1f°F for %s",
+                    forecast_temp, pe.city_code,
+                )
+                continue
 
-                edge = p_model - b.yes_price  # informational only, kept for DB compat
-                reason = (
-                    f"ev={ev:.3f} p_model={p_model:.3f} p_market={b.yes_price:.3f} "
-                    f"forecast={forecast_temp:.1f}°F src={source} sigma={sigma:.2f} "
-                    f"kelly_full={sz.kelly_full:.3f} cap={sz.cap_hit}"
+            # Skip narrow buckets — 1°F-wide buckets are smaller than typical
+            # forecast error so we'd lose to bucket mis-assignment.
+            if (hit_bucket.low is not None and hit_bucket.high is not None
+                    and (hit_bucket.high - hit_bucket.low) < s.min_bucket_width_f):
+                log.debug(
+                    "bucket %s too narrow (%.1f°F < min %.1f) for %s",
+                    hit_bucket.outcome_label,
+                    hit_bucket.high - hit_bucket.low,
+                    s.min_bucket_width_f, pe.city_code,
                 )
-                _insert_signal(
-                    market_id=market_id,
-                    bucket_id=bucket_id_map[b.token_id],
-                    forecast_id=forecast_id,
-                    p_model=p_model,
-                    p_market=b.yes_price,
-                    edge=edge,
-                    ev=ev,
-                    size_usd=sz.size_usd,
-                    kelly_used=sz.kelly_used,
-                    reason=reason,
-                )
-                signals_emitted += 1
-                log.info(
-                    "signal: %s [%s] %s → %s",
-                    pe.city_code, pe.title[:60], b.outcome_label, reason,
-                )
+                continue
+
+            b = hit_bucket
+            if b.yes_price is None or b.yes_price <= 0 or b.yes_price >= 1:
+                continue
+            if b.yes_price < s.min_p_market:
+                continue
+            if b.yes_price > s.max_price:
+                # Never buy favourites. Day-5 data showed entry > 50¢ trades
+                # net out near zero after fees, and post-Phase-2A the model
+                # at the hit bucket already gives p≈0.5 which doesn't justify
+                # paying 50¢+ for the share.
+                continue
+
+            bucket = Bucket(label=b.token_id, low=b.low, high=b.high)
+            p_model = bucket_prob(forecast_temp, bucket, sigma=sigma)
+
+            ev = expected_value(p_model, b.yes_price)
+            if ev < s.min_ev:
+                continue
+
+            sz = recommended_size(
+                p_model=p_model,
+                price=b.yes_price,
+                bankroll=s.paper_bankroll,
+            )
+            if sz.size_usd <= 0:
+                continue
+
+            edge = p_model - b.yes_price  # informational only, kept for DB compat
+            reason = (
+                f"ev={ev:.3f} p_model={p_model:.3f} p_market={b.yes_price:.3f} "
+                f"forecast={forecast_temp:.1f}°F src={source} sigma={sigma:.2f} "
+                f"kelly_full={sz.kelly_full:.3f} cap={sz.cap_hit}"
+            )
+            _insert_signal(
+                market_id=market_id,
+                bucket_id=bucket_id_map[b.token_id],
+                forecast_id=forecast_id,
+                p_model=p_model,
+                p_market=b.yes_price,
+                edge=edge,
+                ev=ev,
+                size_usd=sz.size_usd,
+                kelly_used=sz.kelly_used,
+                reason=reason,
+            )
+            signals_emitted += 1
+            log.info(
+                "signal: %s [%s] %s → %s",
+                pe.city_code, pe.title[:60], b.outcome_label, reason,
+            )
     except Exception as e:  # noqa: BLE001
         error = f"{type(e).__name__}: {e}"
         log.exception("scan failed")
