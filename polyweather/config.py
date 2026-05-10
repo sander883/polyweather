@@ -27,17 +27,12 @@ class Settings(BaseSettings):
         validation_alias="POLYMARKET_CLOB_BASE",
     )
 
-    # Phase 2A.3 — Day-9 review (0/23 wins on Phase 2A.2):
-    #   - probabilistic neighbour-bucket trading produced systematic losses
-    #     because real forecast MAE (3-5°F at D+1 to D+3) is much wider
-    #     than the σ=2°F default; we overestimated p on neighbours by ~2x.
-    #   - many Polymarket weather markets use 1°F-wide buckets, smaller
-    #     than the typical forecast error → bucket mis-assignment is the
-    #     dominant failure mode.
-    # Fix: only trade the bucket the forecast actually hits, skip narrow
-    # buckets, raise sigma to a more honest value, raise min_ev so any
-    # single trade has substantial buffer to survive bucket mis-assignment.
-    min_ev: float = 0.30
+    # Phase 2A.4 (Day-11): Phase 2A.3 emitted 0 signals across 48h because
+    # min_ev=0.30 + σ=4 + min_bucket_width=2 left an empty intersection
+    # — Polymarket weather buckets are mostly 1-2°F wide and rarely priced
+    # below 30¢ at the wider end. Loosen all three to let some signals
+    # through without going back to Phase 2A.2's neighbour-bucket disaster.
+    min_ev: float = 0.20
     min_liquidity: float = 2000.0
     paper_bankroll: float = 500.0
     kelly_fraction: float = 0.25
@@ -48,17 +43,15 @@ class Settings(BaseSettings):
     min_time_to_settle_hours: float = 2.0
     max_time_to_settle_hours: float = 72.0
 
-    # Forecast-error std defaults (°F / °C) for the normal-CDF bucket model.
-    # Bumped from 2.0/1.2 → 4.0/2.4 to match observed ECMWF/HRRR MAE at
-    # 24-72h horizons. Self-calibration (Phase 2C) replaces these with
-    # empirical per-(city, source) MAE.
-    sigma_default_f: float = 4.0
-    sigma_default_c: float = 2.4
+    # Forecast-error std (°F / °C) — mid-range between alteregoeth's
+    # 2.0/1.2 (too tight, made us overconfident) and Phase 2A.3's 4.0/2.4
+    # (too loose, killed all signals).
+    sigma_default_f: float = 3.0
+    sigma_default_c: float = 1.8
 
-    # Skip buckets narrower than this (in °F) — forecast error makes them
-    # un-tradeable. 1°F buckets near the resolution day are common but
-    # smaller than HRRR/ECMWF MAE so we bucket-miss most of the time.
-    min_bucket_width_f: float = 2.0
+    # Skip buckets narrower than this (°F). 1°F buckets are common near
+    # settlement and tradable when the forecast is well-centred.
+    min_bucket_width_f: float = 1.0
 
     # Never buy a "favorite". Markets priced > max_price rarely have enough
     # mispricing to clear EV after slippage + fees.
